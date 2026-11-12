@@ -1,0 +1,100 @@
+# ==========================
+# Dependencies
+# ==========================
+node_modules/
+
+# ==========================
+# Build Output
+# ==========================
+dist/
+build/
+
+# ==========================
+# Environment Variables
+# ==========================
+.env
+.env.*
+!.env.example
+
+# ==========================
+# Logs
+# ==========================
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ==========================
+# OS Files
+# ==========================
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ==========================
+# IDE / Editors
+# ==========================
+.vscode/
+.idea/
+
+# Keep workspace recommendations if needed
+!.vscode/extensions.json
+!.vscode/settings.json
+
+# ==========================
+# Temporary Files
+# ==========================
+*.tmp
+*.temp
+.cache/
+backend/demo_storage/
+
+# ==========================
+# Python Virtual Environments
+# ==========================
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.db
+.venv/
+.venv*/
+venv/
+env/
+ENV/
+
+# ==========================
+# ML Artifacts & Datasets
+# ==========================
+ml/models/*.joblib
+ml/data/*.csv
+backend/ml/models/*.joblib
+backend/ml/data/*.csv
+# Keep the champion model and training corpus tracked
+!ml/models/expense_classifier.joblib
+!ml/data/receipt_expenses_10k.csv
+!backend/ml/models/expense_classifier.joblib
+!backend/ml/data/receipt_expenses_10k.csv
+
+# ==========================
+# Testing & Linting
+# ==========================
+coverage/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pyre/
+
+# ==========================
+# Misc
+# ==========================
+*.swp
+*.swo
+
+# ==========================
+# VS Code History
+# ==========================
+.history/
+

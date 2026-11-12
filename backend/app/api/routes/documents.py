@@ -1,0 +1,1600 @@
+"""Document upload API endpoints."""
+
+from typing import Annotated, Any, Literal
+import asyncio
+from datetime import datetime, timezone
+from pathlib import PurePath
+import re
+import time
+from urllib.parse import quote
+from uuid import UUID, uuid4
+
+import httpx
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, UploadFile, status
+from pydantic import BaseModel
+
+from app.api.dependencies import get_current_user
+from app.core.config import Settings, get_settings
+from app.schemas.auth import CurrentUser
+from app.schemas.documents import (
+    DocumentDeleteResponse,
+    DocumentDetailResponse,
+    DocumentExtractionResponse,
+    DocumentLibraryStats,
+    DocumentListItem,
+    DocumentListResponse,
+    DocumentMetadataResponse,
+    DocumentPreviewResponse,
+    DocumentUploadResponse,
+    DocumentValidationResult,
+    DuplicateDetectionResult,
+    DuplicateDocumentCandidate,
+    MLClassificationResult,
+    MathematicalValidationResult,
+    OriginalDocumentInfo,
+    ReceiptInvoiceExtraction,
+)
+from app.services.quality_signals import derive_extraction_quality_signals
+from app.services.validation_aggregation import aggregate_validation_results
+from app.services.document_metadata import (
+    CreatedDocumentMetadata,
+    create_document_metadata,
+    delete_document_metadata,
+    find_document_metadata_by_content_hash,
+    get_document_metadata,
+    get_user_document_library_stats,
+    list_document_metadata,
+    update_document_extraction_and_quality,
+    update_document_status,
+)
+from app.services.documents import validate_document_upload
+from app.services.extraction_validation import (
+    GeminiExtractionValidationError,
+    validate_receipt_invoice_extraction,
+)
+from app.services.gemini import (
+    GeminiAuthenticationError,
+    GeminiConfigurationError,
+    GeminiServiceUnavailableError,
+    GeminiUnexpectedResponseError,
+    extract_receipt_invoice_document,
+)
+from app.services.mathematical_validation import validate_extraction_totals
+from app.services.duplicate_detection import hash_document_content, detect_duplicate
+from app.services.quality_signals import derive_extraction_quality_signals
+from app.services.ocr import default_ocr_service, OCRError
+from app.services.ai import default_ai_manager, AIExtractionError
+from app.services.ai.local_receipt_extractor import extract_receipt_from_ocr
+from app.services.extraction_cache import default_extraction_cache, default_coalescer
+from app.services.quality import evaluate_extraction_quality, ProviderInfo
+from app.services.quality.schemas import ExtractionQualityResult, QualitySignal
+from app.services.validation_aggregation import aggregate_validation_results
+from app.services.storage import (
+    _is_demo_storage_mode,
+    create_signed_storage_url,
+    delete_document_from_storage,
+    download_document_from_storage,
+    find_document_storage_path,
+    upload_document_to_storage,
+)
+from app.services.export import (
+    generate_document_excel_bytes,
+    generate_export_filename,
+    map_document_to_export_data,
+)
+from app.services.notifications import create_notification
+
+
+class TempUploadSession(BaseModel):
+    document_id: UUID
+    user_id: str
+    filename: str
+    storage_path: str
+    content_type: str
+    size: int
+    content_hash: str
+    created_at: datetime
+
+
+_TEMP_UPLOAD_SESSIONS: dict[UUID, TempUploadSession] = {}
+
+
+def _register_temp_upload_session(
+    document_id: UUID,
+    user_id: str,
+    filename: str,
+    storage_path: str,
+    content_type: str,
+    size: int,
+    content_hash: str,
+    created_at: datetime,
+) -> None:
+    _TEMP_UPLOAD_SESSIONS[document_id] = TempUploadSession(
+        document_id=document_id,
+        user_id=user_id,
+        filename=filename,
+        storage_path=storage_path,
+        content_type=content_type,
+        size=size,
+        content_hash=content_hash,
+        created_at=created_at,
+    )
+
+
+def _get_temp_upload_session(document_id: UUID, user_id: str) -> TempUploadSession | None:
+    session = _TEMP_UPLOAD_SESSIONS.get(document_id)
+    if session and session.user_id == user_id:
+        return session
+    return None
+
+
+def _remove_temp_upload_session(document_id: UUID) -> None:
+    _TEMP_UPLOAD_SESSIONS.pop(document_id, None)
+
+
+router = APIRouter(prefix="/documents", tags=["documents"])
+
+
+# ─── Recent Documents ─────────────────────────────────────────────────────────
+
+@router.get(
+    "/recent",
+    response_model=DocumentListResponse,
+    summary="Get the authenticated user's 5 most-recently processed documents",
+    description=(
+        "Returns up to 5 completed documents owned by the current user, sorted by "
+        "created_at descending.  Used to populate the 'Recently Processed' section "
+        "on the Upload page.  Strictly user-isolated."
+    ),
+)
+async def list_recent_documents(
+    settings: Annotated[Settings, Depends(get_settings)],
+    current_user: Annotated[CurrentUser, Depends(get_current_user)],
+) -> DocumentListResponse:
+    """Return up to 5 most-recent completed documents for the authenticated user."""
+    records, total = await list_document_metadata(
+        user_id=current_user.user_id,
+        page=1,
+        page_size=5,
+        settings=settings,
+        # status defaults to 'completed' inside list_document_metadata
+    )
+
+    items: list[DocumentListItem] = []
+    for doc in records:
+        ext_data = doc.extraction_result or {}
+        qual_data = doc.quality_result or {}
+        has_ext = doc.extraction_result is not None or doc.status == "completed"
+
+        override_level = qual_data.get("confidence_override")
+        system_level = qual_data.get("system_confidence_level")
+        effective_conf_level = override_level or system_level or qual_data.get("confidence_level")
+        if not effective_conf_level and qual_data.get("overall_confidence") is not None:
+            score = qual_data.get("overall_confidence", 0.0)
+            effective_conf_level = "HIGH" if score >= 0.80 else "MEDIUM" if score >= 0.55 else "LOW"
+
+        effective_needs_review = False if effective_conf_level == "HIGH" else True
+
+        # Inline ML classification for list view
+        ml_list_result = None
+        if ext_data:
+            try:
+                from app.services.ml.classifier import classify_document_expense
+                _pred = classify_document_expense(
+                    vendor_name=ext_data.get("vendor_company"),
+                    line_items=ext_data.get("line_items", []),
+                    total_amount=ext_data.get("total"),
+                    filename=doc.filename,
+                )
+                if _pred.get("ml_model_active"):
+                    ml_list_result = MLClassificationResult(
+                        category=_pred["ml_category"],
+                        confidence=_pred["ml_confidence"],
+                        confidence_percent=f"{_pred['ml_confidence'] * 100:.1f}%",
+                        model_name="Trained Expense Classifier (10k Dataset)",
+                    )
+            except Exception:
+                pass
+
+        items.append(
+            DocumentListItem(
+                document_id=doc.id,
+                filename=doc.filename,
+                storage_path=doc.storage_path,
+                content_type=doc.content_type,
+                size=doc.size,
+                status=doc.status,
+                created_at=doc.created_at,
+                processed_at=doc.processed_at,
+                content_hash=doc.content_hash,
+                has_extraction=has_ext,
+                vendor_name=ext_data.get("vendor_company"),
+                total_amount=ext_data.get("total"),
+                document_date=ext_data.get("date"),
+                confidence_level=effective_conf_level,
+                confidence_score=qual_data.get("overall_confidence"),
+                system_confidence_level=system_level or qual_data.get("confidence_level"),
+                confidence_override=override_level,
+                needs_review=effective_needs_review,
+                ml_classification=ml_list_result,
+            )
+        )
+
+    # Re-use zero stats for this lightweight endpoint
+    stats = DocumentLibraryStats(total=total, processed=0, needs_review=0)
+    return DocumentListResponse(
+        items=items,
+        page=1,
+        page_size=5,
+        total=total,
+        has_next=False,
+        stats=stats,
+    )
+
+
+@router.get(
+    "",
+    response_model=DocumentListResponse,
+    summary="List current user's documents for the Document Library",
+)
+async def list_documents(
+    settings: Annotated[Settings, Depends(get_settings)],
+    current_user: Annotated[CurrentUser, Depends(get_current_user)],
+    page: Annotated[int, Query(ge=1, description="1-indexed page number.")] = 1,
+    page_size: Annotated[int, Query(ge=1, le=100, description="Page size limit.")] = 20,
+    q: Annotated[str | None, Query(description="Search term for filename or vendor.")] = None,
+    status_filter: Annotated[str | None, Query(description="Status filter: processed, review, all.")] = None,
+    doc_type: Annotated[str | None, Query(description="Doc type filter: RECEIPT, INVOICE, all.")] = None,
+    sort_by: Annotated[str | None, Query(description="Sort order: newest, oldest, date_desc, date_asc, amount_desc, amount_asc.")] = "newest",
+) -> DocumentListResponse:
+    """Return paginated metadata and extraction summaries owned by the authenticated user."""
+    db_status = None
+    db_needs_review: bool | None = None
+    if status_filter == "processed":
+        db_needs_review = False
+    elif status_filter == "review":
+        db_needs_review = True
+    elif status_filter == "all":
+        db_status = "all"
+
+    kwargs: dict[str, Any] = {
+        "user_id": current_user.user_id,
+        "page": page,
+        "page_size": page_size,
+        "settings": settings,
+    }
+    if db_status:
+        kwargs["status_filter"] = db_status
+    if db_needs_review is not None:
+        kwargs["needs_review"] = db_needs_review
+    if doc_type and doc_type != "all":
+        kwargs["doc_type"] = doc_type
+    if q:
+        kwargs["search"] = q
+    if sort_by and sort_by != "newest":
+        kwargs["sort_by"] = sort_by
+
+    records, total = await list_document_metadata(**kwargs)
+    global_total, stats_processed, stats_needs_review = await get_user_document_library_stats(
+        user_id=current_user.user_id, settings=settings
+    )
+
+    if global_total == 0 and records:
+        global_total = total
+        for doc in records:
+            if doc.status == "completed":
+                q_d = doc.quality_result or {}
+                eff_l = q_d.get("confidence_override") or q_d.get("system_confidence_level") or q_d.get("confidence_level")
+                if not eff_l and q_d.get("overall_confidence") is not None:
+                    sc = q_d.get("overall_confidence", 0.0)
+                    eff_l = "HIGH" if sc >= 0.80 else "MEDIUM" if sc >= 0.55 else "LOW"
+                if eff_l == "HIGH":
+                    stats_processed += 1
+                else:
+                    stats_needs_review += 1
+
+    items: list[DocumentListItem] = []
+
+    for doc in records:
+        ext_data = doc.extraction_result or {}
+        qual_data = doc.quality_result or {}
+        has_ext = doc.extraction_result is not None or doc.status == "completed"
+
+        override_level = qual_data.get("confidence_override")
+        system_level = qual_data.get("system_confidence_level")
+        # Effective confidence level: confidence_override ?? system_confidence_level ?? confidence_level (for legacy documents)
+        effective_conf_level = override_level or system_level or qual_data.get("confidence_level")
+        if not effective_conf_level and qual_data.get("overall_confidence") is not None:
+            score = qual_data.get("overall_confidence", 0.0)
+            effective_conf_level = "HIGH" if score >= 0.80 else "MEDIUM" if score >= 0.55 else "LOW"
+
+        effective_needs_review = False if effective_conf_level == "HIGH" else True
+
+        # Inline ML classification for list view
+        ml_list_result = None
+        if ext_data:
+            try:
+                from app.services.ml.classifier import classify_document_expense
+                _pred = classify_document_expense(
+                    vendor_name=ext_data.get("vendor_company"),
+                    line_items=ext_data.get("line_items", []),
+                    total_amount=ext_data.get("total"),
+                    filename=doc.filename,
+                )
+                if _pred.get("ml_model_active"):
+                    ml_list_result = MLClassificationResult(
+                        category=_pred["ml_category"],
+                        confidence=_pred["ml_confidence"],
+                        confidence_percent=f"{_pred['ml_confidence'] * 100:.1f}%",
+                        model_name="Trained Expense Classifier (10k Dataset)",
+                    )
+            except Exception:
+                pass
+
+        items.append(
+            DocumentListItem(
+                document_id=doc.id,
+                filename=doc.filename,
+                storage_path=doc.storage_path,
+                content_type=doc.content_type,
+                size=doc.size,
+                status=doc.status,
+                created_at=doc.created_at,
+                processed_at=doc.processed_at,
+                content_hash=doc.content_hash,
+                has_extraction=has_ext,
+                vendor_name=ext_data.get("vendor_company"),
+                total_amount=ext_data.get("total"),
+                document_date=ext_data.get("date"),
+                confidence_level=effective_conf_level,
+                confidence_score=qual_data.get("overall_confidence"),
+                system_confidence_level=system_level or qual_data.get("confidence_level"),
+                confidence_override=override_level,
+                needs_review=effective_needs_review,
+                ml_classification=ml_list_result,
+            )
+        )
+
+    stats = DocumentLibraryStats(
+        total=global_total,
+        processed=stats_processed,
+        needs_review=stats_needs_review,
+    )
+
+    has_next = (page * page_size) < total
+    return DocumentListResponse(
+        items=items,
+        page=page,
+        page_size=page_size,
+        total=total,
+        has_next=has_next,
+        stats=stats,
+    )
+
+
+async def _build_detail_response(
+    record: CreatedDocumentMetadata, settings: Settings
+) -> DocumentDetailResponse:
+    """Construct DocumentDetailResponse from metadata record and storage url."""
+    extraction_model = None
+    validation_model = None
+    if record.extraction_result:
+        try:
+            extraction_model = ReceiptInvoiceExtraction.model_validate(record.extraction_result)
+            validation_model = validate_extraction_totals(extraction_model)
+        except Exception:
+            pass
+
+    quality_model = None
+    if record.quality_result:
+        try:
+            qual_dict = dict(record.quality_result)
+            if "system_confidence" not in qual_dict or qual_dict.get("system_confidence") is None:
+                qual_dict["system_confidence"] = qual_dict.get("overall_confidence", 0.85)
+            if "system_confidence_level" not in qual_dict or not qual_dict.get("system_confidence_level"):
+                score = qual_dict.get("system_confidence", 0.85)
+                qual_dict["system_confidence_level"] = "HIGH" if score >= 0.80 else "MEDIUM" if score >= 0.55 else "LOW"
+            if "confidence_level" not in qual_dict or not qual_dict.get("confidence_level"):
+                qual_dict["confidence_level"] = qual_dict.get("confidence_override") or qual_dict["system_confidence_level"]
+
+            quality_model = ExtractionQualityResult.model_validate(qual_dict)
+        except Exception:
+            pass
+
+    download_url = await create_signed_storage_url(record.storage_path, settings)
+
+    ml_result = None
+    if extraction_model:
+        try:
+            from app.services.ml.classifier import classify_document_expense
+            pred = classify_document_expense(
+                vendor_name=extraction_model.vendor_company,
+                line_items=extraction_model.line_items,
+                total_amount=extraction_model.total,
+                filename=record.filename,
+            )
+            if pred.get("ml_model_active"):
+                ml_result = MLClassificationResult(
+                    category=pred["ml_category"],
+                    confidence=pred["ml_confidence"],
+                    confidence_percent=f"{pred['ml_confidence'] * 100:.1f}%",
+                    model_name="Trained Expense Classifier (10k Dataset)",
+                )
+        except Exception as err:
+            print(f"[STRUCTRA ML WARN] Failed to classify document: {err}")
+
+    return DocumentDetailResponse(
+        document=_metadata_response(record),
+        extraction=extraction_model,
+        quality=quality_model,
+        validation=validation_model,
+        original=OriginalDocumentInfo(
+            download_url=download_url,
+            content_type=record.content_type,
+            filename=record.filename,
+        ),
+        ml_classification=ml_result,
+    )
+
+
+@router.get(
+    "/{document_id}",
+    response_model=DocumentDetailResponse,
+    summary="Get detailed metadata, saved extraction, and quality signals for one document",
+    responses={404: {"description": "Document not found."}},
+)
+async def get_document(
+    document_id: UUID,
+    settings: Annotated[Settings, Depends(get_settings)],
+    current_user: Annotated[CurrentUser, Depends(get_current_user)],
+) -> DocumentDetailResponse:
+    """Return detailed metadata and saved extraction only if owned by current user."""
+    record = await get_document_metadata(
+        document_id=document_id, user_id=current_user.user_id, settings=settings
+    )
+    if record is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found.")
+
+    return await _build_detail_response(record, settings)
+
+
+@router.get(
+    "/{document_id}/preview",
+    response_model=DocumentPreviewResponse,
+    summary="Get a short-lived signed preview URL for one owned document",
+    responses={
+        404: {"description": "Document not found."},
+        503: {"description": "Document storage is unavailable."},
+    },
+)
+async def preview_document(
+    document_id: UUID,
+    settings: Annotated[Settings, Depends(get_settings)],
+    current_user: Annotated[CurrentUser, Depends(get_current_user)],
+    expires_in: Annotated[int, Query(ge=60, le=86400, description="Expiration in seconds.")] = 3600,
+) -> DocumentPreviewResponse:
+    """Return a short-lived signed URL for previewing the private original document."""
+    metadata = await get_document_metadata(
+        document_id=document_id, user_id=current_user.user_id, settings=settings
+    )
+    if metadata is not None:
+        storage_path = metadata.storage_path
+        content_type = metadata.content_type
+        filename = metadata.filename
+    else:
+        session = _get_temp_upload_session(document_id, current_user.user_id)
+        if session is not None:
+            storage_path = session.storage_path
+            content_type = session.content_type
+            filename = session.filename
+        else:
+            found_path = await find_document_storage_path(
+                user_id=current_user.user_id, document_id=document_id, settings=settings
+            )
+            if not found_path:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found.")
+            storage_path = found_path
+            filename = PurePath(found_path).name
+            ext = PurePath(found_path).suffix.lower()
+            content_type = "application/pdf" if ext == ".pdf" else f"image/{ext.lstrip('.')}"
+
+    preview_url = await create_signed_storage_url(
+        storage_path, settings, expires_in=expires_in
+    )
+
+    return DocumentPreviewResponse(
+        preview_url=preview_url,
+        expires_in=expires_in,
+        content_type=content_type,
+        filename=filename,
+    )
+
+
+@router.get(
+    "/{document_id}/download",
+    summary="Download one owned document",
+    responses={
+        404: {"description": "Document or storage object not found."},
+        503: {"description": "Document storage is unavailable."},
+    },
+)
+async def download_document(
+    document_id: UUID,
+    settings: Annotated[Settings, Depends(get_settings)],
+    current_user: Annotated[CurrentUser, Depends(get_current_user)],
+) -> Response:
+    """Return the original private Storage object only to its authenticated owner."""
+    metadata = await get_document_metadata(
+        document_id=document_id, user_id=current_user.user_id, settings=settings
+    )
+    if metadata is not None:
+        storage_path = metadata.storage_path
+        content_type = metadata.content_type
+        filename = metadata.filename
+    else:
+        session = _get_temp_upload_session(document_id, current_user.user_id)
+        if session is not None:
+            storage_path = session.storage_path
+            content_type = session.content_type
+            filename = session.filename
+        else:
+            found_path = await find_document_storage_path(
+                user_id=current_user.user_id, document_id=document_id, settings=settings
+            )
+            if not found_path:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found.")
+            storage_path = found_path
+            filename = PurePath(found_path).name
+            ext = PurePath(found_path).suffix.lower()
+            content_type = "application/pdf" if ext == ".pdf" else f"image/{ext.lstrip('.')}"
+
+    content = await download_document_from_storage(storage_path, settings)
+    download_name = quote(filename, safe="")
+    return Response(
+        content=content,
+        media_type=content_type,
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{download_name}"},
+    )
+
+
+@router.get(
+    "/{document_id}/export",
+    summary="Export one owned document as a formatted STRUCTRA Excel (.xlsx) workbook",
+    responses={
+        404: {"description": "Document not found."},
+        503: {"description": "Document metadata service is unavailable."},
+    },
+)
+async def export_document(
+    document_id: UUID,
+    settings: Annotated[Settings, Depends(get_settings)],
+    current_user: Annotated[CurrentUser, Depends(get_current_user)],
+) -> Response:
+    """Generate and return a professional STRUCTRA Excel report (.xlsx) for an authenticated user's document."""
+    metadata = await get_document_metadata(
+        document_id=document_id, user_id=current_user.user_id, settings=settings
+    )
+    if metadata is not None:
+        export_data = map_document_to_export_data(metadata)
+    else:
+        # Fallback to active temp upload session (e.g. document on the upload result workspace before Save to Library)
+        session = _get_temp_upload_session(document_id, current_user.user_id)
+        if session is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found.")
+
+        try:
+            content = await download_document_from_storage(session.storage_path, settings)
+            content_hash = hash_document_content(content)
+            cached_extraction = await default_extraction_cache.get(content_hash, settings=settings)
+            ext_dict = cached_extraction.model_dump(mode="json") if cached_extraction else {}
+        except Exception:
+            ext_dict = {}
+
+        temp_doc_dict = {
+            "id": str(document_id),
+            "user_id": current_user.user_id,
+            "filename": session.filename,
+            "storage_path": session.storage_path,
+            "content_type": session.content_type,
+            "size": session.size,
+            "status": "completed",
+            "created_at": session.created_at.isoformat(),
+            "processed_at": datetime.now(timezone.utc).isoformat(),
+            "extraction_result": ext_dict,
+            "quality_result": {},
+        }
+        export_data = map_document_to_export_data(temp_doc_dict)
+
+    excel_bytes = generate_document_excel_bytes(export_data)
+    filename = generate_export_filename(export_data)
+    download_name = quote(filename, safe="")
+
+    # Fire-and-forget notification: document exported
+    import re
+    _raw_export_name = (
+        export_data.filename
+        if hasattr(export_data, "filename") and export_data.filename
+        else (export_data.get("filename") if isinstance(export_data, dict) else None)
+    )
+    if not _raw_export_name or re.match(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", str(_raw_export_name), re.I):
+        if metadata and getattr(metadata, "filename", None):
+            _raw_export_name = metadata.filename
+        elif "temp_doc_dict" in locals() and temp_doc_dict.get("filename"):
+            _raw_export_name = temp_doc_dict.get("filename")
+        else:
+            _raw_export_name = "Document"
+
+    _export_doc_name = _raw_export_name
+    asyncio.create_task(
+        create_notification(
+            user_id=current_user.user_id,
+            event_type="document_exported",
+            document_name=_export_doc_name,
+            document_id=str(document_id),
+            settings=settings,
+        )
+    )
+
+    return Response(
+        content=excel_bytes,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"; filename*=UTF-8\'\'{download_name}'
+        },
+    )
+
+
+@router.delete(
+    "/{document_id}",
+    response_model=DocumentDeleteResponse,
+    summary="Delete one owned document (storage + metadata)",
+    responses={
+        404: {"description": "Document not found."},
+        503: {"description": "Storage or metadata service is unavailable."},
+    },
+)
+async def delete_document(
+    document_id: UUID,
+    settings: Annotated[Settings, Depends(get_settings)],
+    current_user: Annotated[CurrentUser, Depends(get_current_user)],
+) -> DocumentDeleteResponse:
+    """Delete an owned document from Supabase Storage and the metadata table."""
+    metadata = await get_document_metadata(
+        document_id=document_id, user_id=current_user.user_id, settings=settings
+    )
+    if metadata is not None:
+        storage_path = metadata.storage_path
+    else:
+        session = _get_temp_upload_session(document_id, current_user.user_id)
+        if session is not None:
+            storage_path = session.storage_path
+        else:
+            found_path = await find_document_storage_path(
+                user_id=current_user.user_id, document_id=document_id, settings=settings
+            )
+            if not found_path:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found.")
+            storage_path = found_path
+
+    # Remove the stored file first (ignore if already missing)
+    try:
+        await delete_document_from_storage(storage_path, settings)
+    except HTTPException:
+        # Storage deletion failure (e.g. 503 network error) is fatal -> preserves DB row
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Unable to delete document from storage.",
+        )
+
+    if metadata is not None:
+        await delete_document_metadata(
+            document_id=document_id, user_id=current_user.user_id, settings=settings
+        )
+
+    _remove_temp_upload_session(document_id)
+
+    # Fire-and-forget notification: document deleted
+    # Use filename from metadata if available, otherwise we won't have it
+    _doc_name = metadata.filename if metadata is not None else str(document_id)
+    asyncio.create_task(
+        create_notification(
+            user_id=current_user.user_id,
+            event_type="document_deleted",
+            document_name=_doc_name,
+            settings=settings,
+        )
+    )
+
+    return DocumentDeleteResponse()
+
+
+@router.post(
+    "/{document_id}/extract",
+    response_model=DocumentExtractionResponse,
+    summary="Extract structured receipt or invoice data from one owned document",
+    responses={
+        404: {"description": "Document not found."},
+        503: {"description": "Document storage or extraction service is unavailable."},
+    },
+)
+async def extract_document(
+    document_id: UUID,
+    settings: Annotated[Settings, Depends(get_settings)],
+    current_user: Annotated[CurrentUser, Depends(get_current_user)],
+) -> DocumentExtractionResponse:
+    """Extract JSON from an owned document (persists status only if already saved in library)."""
+    # Uploads are intentionally staged without a database row until the user
+    # confirms the extraction. Check that staging session first so analysis
+    # does not depend on a metadata lookup for a document that is not saved yet.
+    session = _get_temp_upload_session(document_id, current_user.user_id)
+    metadata = None
+    if session is None:
+        metadata = await get_document_metadata(
+            document_id=document_id, user_id=current_user.user_id, settings=settings
+        )
+
+    if metadata is not None:
+        storage_path = metadata.storage_path
+        filename = metadata.filename
+        content_type = metadata.content_type
+        try:
+            await update_document_status(
+                document_id=metadata.id,
+                user_id=current_user.user_id,
+                document_status="processing",
+                settings=settings,
+            )
+        except HTTPException as error:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Document extraction is unavailable.",
+            ) from error
+    else:
+        if session is not None:
+            storage_path = session.storage_path
+            filename = session.filename
+            content_type = session.content_type
+        else:
+            found_path = await find_document_storage_path(
+                user_id=current_user.user_id, document_id=document_id, settings=settings
+            )
+            if not found_path:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found.")
+            storage_path = found_path
+            filename = PurePath(found_path).name
+            ext = PurePath(found_path).suffix.lower()
+            content_type = "application/pdf" if ext == ".pdf" else f"image/{ext.lstrip('.')}"
+
+    try:
+        t_storage0 = time.perf_counter()
+        content = await download_document_from_storage(storage_path, settings)
+        t_storage1 = time.perf_counter()
+        print(f"[STRUCTRA PERF] Download Document from Storage: {(t_storage1 - t_storage0)*1000:.1f} ms")
+
+        t_hash0 = time.perf_counter()
+        content_hash = hash_document_content(content)
+        t_hash1 = time.perf_counter()
+        print(f"[STRUCTRA PERF] Content hash: {(t_hash1 - t_hash0)*1000:.2f} ms")
+
+        cached_extraction = await default_extraction_cache.get(content_hash, settings=settings)
+        is_cache_miss = False
+        active_provider_info = None
+        ocr_result_for_quality = None
+        local_fallback_reason: str | None = None
+
+        if cached_extraction is not None:
+            # CACHE HIT PATH: Re-validate cached extraction with Pydantic
+            validated_extraction = ReceiptInvoiceExtraction.model_validate(
+                cached_extraction.model_dump(mode="json")
+            )
+        else:
+            # CACHE MISS PATH: Execute coalesced AI extraction
+            print(f"[STRUCTRA CACHE] MISS | Hash: {content_hash[:8]}")
+            is_cache_miss = True
+
+            async def _perform_ai_extraction() -> ReceiptInvoiceExtraction:
+                nonlocal ocr_result_for_quality
+                ocr_task = asyncio.create_task(
+                    default_ocr_service.extract_text_from_bytes_async(
+                        content, filename=filename
+                    )
+                )
+
+                async def _local_ocr_fallback(reason: str) -> ReceiptInvoiceExtraction:
+                    nonlocal ocr_result_for_quality, local_fallback_reason
+                    local_fallback_reason = reason
+                    try:
+                        ocr_result_for_quality = await ocr_task
+                        local_result = extract_receipt_from_ocr(ocr_result_for_quality)
+                    except Exception as local_error:
+                        print(
+                            "[STRUCTRA AI] Local OCR fallback failed: "
+                            f"{local_error}"
+                        )
+                        raise AIExtractionError(
+                            "Cloud AI is unavailable and local OCR could not read "
+                            "enough receipt text."
+                        ) from local_error
+
+                    default_ai_manager.last_used_provider_info = ProviderInfo(
+                        provider="RapidOCR (local fallback)",
+                        model="Deterministic receipt parser",
+                    )
+                    print(f"[STRUCTRA AI] Using local OCR fallback: {reason}")
+                    return local_result
+
+                def _has_real_api_key(secret: Any) -> bool:
+                    if secret is None:
+                        return False
+                    key = (
+                        secret.get_secret_value()
+                        if hasattr(secret, "get_secret_value")
+                        else str(secret)
+                    ).strip().lower()
+                    return bool(key) and key not in {
+                        "dummy", "test", "example", "changeme", "placeholder",
+                        "your_api_key", "your_gemini_api_key", "your_groq_api_key",
+                    } and not key.startswith("your_")
+
+                if not any(
+                    _has_real_api_key(key)
+                    for key in (
+                        getattr(settings, "gemini_api_key", None),
+                        getattr(settings, "groq_api_key", None),
+                    )
+                ):
+                    return await _local_ocr_fallback(
+                        "no usable Gemini or Groq API key is configured"
+                    )
+
+                try:
+                    return await default_ai_manager.extract_document(
+                        content,
+                        content_type=content_type,
+                        ocr_task=ocr_task,
+                    )
+                except AIExtractionError as ai_error:
+                    # Cloud vision/LLM providers may be unreachable in local or
+                    # demo setups. Keep receipt analysis available using the
+                    # local OCR text parser, and clearly mark its result for review.
+                    return await _local_ocr_fallback(
+                        f"cloud providers unavailable ({type(ai_error).__name__})"
+                    )
+
+            t_extract0 = time.perf_counter()
+            validated_extraction = await default_coalescer.run_coalesced(
+                content_hash, _perform_ai_extraction
+            )
+            t_extract1 = time.perf_counter()
+            active_provider_info = getattr(default_ai_manager, "last_used_provider_info", None)
+            if active_provider_info is None:
+                try:
+                    active_provider_info = ProviderInfo(
+                        provider=default_ai_manager.active_provider.provider_name,
+                        model=default_ai_manager.active_provider.model_name,
+                    )
+                except Exception:
+                    active_provider_info = ProviderInfo(provider="gemini", model="gemini-3.1-flash-lite")
+            print(f"[STRUCTRA PERF] AI Extraction ({active_provider_info.provider}): {(t_extract1 - t_extract0)*1000:.1f} ms")
+
+        # Some providers omit document-level additions, and older cached
+        # extractions may predate the full tax/charge breakdown. Use local OCR
+        # to fill missing named rows without replacing the provider's values.
+        if not validated_extraction.tax_components or not validated_extraction.additional_charges:
+            try:
+                if ocr_result_for_quality is None:
+                    ocr_result_for_quality = await default_ocr_service.extract_text_from_bytes_async(
+                        content, filename=filename
+                    )
+                local_financials = extract_receipt_from_ocr(ocr_result_for_quality)
+                financial_updates: dict[str, Any] = {}
+                known_tax_names = {
+                    re.sub(r"[^a-z0-9]+", "", item.name.lower())
+                    for item in validated_extraction.tax_components
+                }
+                missing_tax_rows = [
+                    item for item in local_financials.tax_components
+                    if re.sub(r"[^a-z0-9]+", "", item.name.lower()) not in known_tax_names
+                ]
+                merged_tax_components = [*validated_extraction.tax_components, *missing_tax_rows]
+                if missing_tax_rows:
+                    financial_updates["tax_components"] = merged_tax_components
+                if merged_tax_components and all(item.amount is not None for item in merged_tax_components):
+                    if missing_tax_rows or validated_extraction.tax is None:
+                        financial_updates["tax"] = round(
+                            sum(float(item.amount or 0) for item in merged_tax_components), 2
+                        )
+                elif validated_extraction.tax is None and local_financials.tax is not None:
+                    financial_updates["tax"] = local_financials.tax
+
+                known_charge_names = {
+                    re.sub(r"[^a-z0-9]+", "", item.name.lower())
+                    for item in validated_extraction.additional_charges
+                }
+                missing_charge_rows = [
+                    item for item in local_financials.additional_charges
+                    if re.sub(r"[^a-z0-9]+", "", item.name.lower()) not in known_charge_names
+                ]
+                if missing_charge_rows:
+                    financial_updates["additional_charges"] = [
+                        *validated_extraction.additional_charges, *missing_charge_rows
+                    ]
+                if validated_extraction.subtotal is None and local_financials.subtotal is not None:
+                    financial_updates["subtotal"] = local_financials.subtotal
+                if validated_extraction.service_charge is None and local_financials.service_charge is not None:
+                    financial_updates["service_charge"] = local_financials.service_charge
+                if validated_extraction.round_off is None and local_financials.round_off is not None:
+                    financial_updates["round_off"] = local_financials.round_off
+                if validated_extraction.total is None and local_financials.total is not None:
+                    financial_updates["total"] = local_financials.total
+                if financial_updates:
+                    validated_extraction = validated_extraction.model_copy(update=financial_updates)
+            except Exception as ocr_financial_error:
+                print(f"[STRUCTRA TAX OCR] Could not enrich GST fields: {ocr_financial_error}")
+
+        # Extraction providers sometimes mistake receipt reference numbers
+        # (notably KOT numbers on restaurant bills) for a priced line item.
+        # Apply this guard after every provider and cache path so these cannot
+        # be returned or persisted as products/services.
+        non_item_reference = re.compile(
+            r"^\s*KOT\s*(?:NO\.?|NUMBER)?\b|^\s*ORDER\s*(?:NO\.?|NUMBER|ID)\b",
+            re.IGNORECASE,
+        )
+        filtered_line_items = [
+            item for item in validated_extraction.line_items
+            if not non_item_reference.search(item.description)
+        ]
+        if len(filtered_line_items) != len(validated_extraction.line_items):
+            removed_count = len(validated_extraction.line_items) - len(filtered_line_items)
+            print(f"[STRUCTRA EXTRACTION] Removed {removed_count} receipt reference row(s) from line items")
+            validated_extraction = validated_extraction.model_copy(
+                update={"line_items": filtered_line_items}
+            )
+
+        quality_res = evaluate_extraction_quality(
+            validated_extraction,
+            ocr_result=ocr_result_for_quality,
+            provider_info=active_provider_info,
+        )
+
+        if active_provider_info and active_provider_info.provider == "RapidOCR (local fallback)":
+            quality_res.needs_review = True
+            quality_res.signals.append(
+                QualitySignal(
+                    code="LOCAL_OCR_FALLBACK",
+                    severity="warning",
+                    message=(
+                        (
+                            "No valid Gemini or Groq API key is configured. Add a provider key "
+                            "to backend/.env; this result was extracted locally from OCR and "
+                            "should be reviewed."
+                            if local_fallback_reason == "no usable Gemini or Groq API key is configured"
+                            else "Cloud AI providers could not complete extraction. This result was "
+                            "extracted locally from OCR and should be reviewed."
+                        )
+                    ),
+                )
+            )
+
+        # Cache STORE: Only store in cache after full downstream extraction/validation succeeds
+        if is_cache_miss and not (
+            active_provider_info
+            and active_provider_info.provider == "RapidOCR (local fallback)"
+        ):
+            await default_extraction_cache.set(content_hash, validated_extraction, settings=settings)
+    except HTTPException:
+        if metadata is not None:
+            await _mark_extraction_failed(metadata.id, current_user.user_id, settings)
+        raise
+    except (
+        OCRError,
+        AIExtractionError,
+        GeminiAuthenticationError,
+        GeminiConfigurationError,
+        GeminiServiceUnavailableError,
+        GeminiUnexpectedResponseError,
+        GeminiExtractionValidationError,
+    ) as error:
+        if metadata is not None:
+            await _mark_extraction_failed(metadata.id, current_user.user_id, settings)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "Cloud AI providers are unavailable and local OCR could not read enough "
+                "receipt text. Check the Gemini/Groq API keys and backend network access, "
+                "or upload a sharper image."
+                if isinstance(error, (AIExtractionError, OCRError))
+                else "Document extraction is unavailable."
+            ),
+        ) from error
+
+    if metadata is not None:
+        try:
+            await update_document_extraction_and_quality(
+                document_id=metadata.id,
+                user_id=current_user.user_id,
+                extraction=validated_extraction.model_dump(mode="json"),
+                quality=quality_res.model_dump(mode="json"),
+                settings=settings,
+            )
+        except HTTPException as error:
+            print("[DEBUG EXTRACT EXC]:", repr(error))
+            await _mark_extraction_failed(metadata.id, current_user.user_id, settings)
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Document extraction is unavailable.",
+            ) from error
+
+    ml_res = None
+    try:
+        from app.services.ml.classifier import classify_document_expense
+        pred = classify_document_expense(
+            vendor_name=validated_extraction.vendor_company,
+            line_items=validated_extraction.line_items,
+            total_amount=validated_extraction.total,
+            filename=filename,
+        )
+        if pred.get("ml_model_active"):
+            ml_res = MLClassificationResult(
+                category=pred["ml_category"],
+                confidence=pred["ml_confidence"],
+                confidence_percent=f"{pred['ml_confidence'] * 100:.1f}%",
+                model_name="Trained Expense Classifier (10k Dataset)",
+            )
+    except Exception as err:
+        print(f"[STRUCTRA ML WARN] Failed to classify extraction: {err}")
+
+    return DocumentExtractionResponse(
+        document_id=document_id,
+        extraction=validated_extraction,
+        quality=quality_res,
+        ml_classification=ml_res,
+    )
+
+
+async def _mark_extraction_failed(document_id: UUID, user_id: str, settings: Settings) -> None:
+    """Attempt a failure transition without replacing the original safe error."""
+    try:
+        await update_document_status(
+            document_id=document_id,
+            user_id=user_id,
+            document_status="failed",
+            settings=settings,
+        )
+    except Exception:
+        pass
+
+
+@router.post(
+    "/upload",
+    response_model=DocumentUploadResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Receive and validate a document upload",
+    description=(
+        "Receives one `multipart/form-data` document, calculates its SHA-256 hash, "
+        "and checks for duplicates in the authenticated user's library. Valid documents "
+        "are stored in private storage for processing without prematurely creating a database record."
+    ),
+    responses={
+        400: {"description": "Missing, malformed, or empty file."},
+        401: {"description": "Missing, malformed, expired, or invalid bearer token."},
+        413: {"description": "File exceeds the configured size limit."},
+        415: {"description": "File type is not PDF, JPG/JPEG, or PNG."},
+        422: {"description": "Malformed multipart/form-data request."},
+        503: {"description": "Supabase Auth, Storage, or metadata service is unavailable."},
+    },
+)
+async def upload_document(
+    settings: Annotated[Settings, Depends(get_settings)],
+    current_user: Annotated[CurrentUser, Depends(get_current_user)],
+    file: Annotated[UploadFile | None, File(description="PDF, JPG/JPEG, or PNG file")] = None,
+    force_duplicate: Annotated[bool, Query(description="If true, bypass duplicate fast-path and allow processing.")] = False,
+) -> DocumentUploadResponse:
+    """Verify, validate, calculate SHA-256, check duplicates, and store for processing."""
+    if file is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="A document file is required.",
+        )
+
+    t_upload0 = time.perf_counter()
+    size = await validate_document_upload(file, settings)
+    await file.seek(0)
+    file_bytes = await file.read()
+
+    t_hash0 = time.perf_counter()
+    content_hash = hash_document_content(file_bytes)
+    t_hash1 = time.perf_counter()
+    print(f"[STRUCTRA PERF] Content Hash: {(t_hash1 - t_hash0)*1000:.1f} ms")
+
+    # Fast-Path Duplicate Pre-Check: Check if authenticated user already owns a saved document with matching content_hash
+    if not force_duplicate:
+        existing_duplicates = await find_document_metadata_by_content_hash(
+            content_hash=content_hash,
+            user_id=current_user.user_id,
+            settings=settings,
+        )
+        if existing_duplicates:
+            existing_doc = existing_duplicates[0]
+            print(f"[STRUCTRA DUPLICATE] Fast-path hit for user {current_user.user_id} | Existing Doc: {existing_doc.id}")
+            return DocumentUploadResponse(
+                filename=file.filename or existing_doc.filename,
+                content_type=file.content_type or existing_doc.content_type,
+                size=size,
+                storage_path=existing_doc.storage_path,
+                document_id=existing_doc.id,
+                status=existing_doc.status,
+                created_at=existing_doc.created_at,
+                message="This document already exists in your Document Library.",
+                is_duplicate=True,
+                existing_document_id=existing_doc.id,
+            )
+
+    await file.seek(0)  # reset before upload to storage
+
+    t_store0 = time.perf_counter()
+    document_id = uuid4()
+    storage_path = await upload_document_to_storage(
+        file, current_user.user_id, settings, document_id=document_id
+    )
+    t_store1 = time.perf_counter()
+    print(f"[STRUCTRA PERF] Storage Upload: {(t_store1 - t_store0)*1000:.1f} ms")
+
+    now_utc = datetime.now(timezone.utc)
+    _register_temp_upload_session(
+        document_id=document_id,
+        user_id=current_user.user_id,
+        filename=file.filename or "",
+        storage_path=storage_path,
+        content_type=file.content_type or "application/octet-stream",
+        size=size,
+        content_hash=content_hash,
+        created_at=now_utc,
+    )
+
+    # STRICT PERSISTENCE BOUNDARY: DO NOT INSERT INTO public.documents ON UPLOAD
+    print(f"[STRUCTRA PERF] Upload Total: {(time.perf_counter() - t_upload0)*1000:.1f} ms")
+    return DocumentUploadResponse(
+        filename=file.filename or "",
+        content_type=file.content_type or "application/octet-stream",
+        size=size,
+        storage_path=storage_path,
+        document_id=document_id,
+        status="pending",
+        created_at=now_utc,
+        is_duplicate=False,
+        existing_document_id=None,
+    )
+
+
+@router.post(
+    "/{document_id}/validate",
+    response_model=DocumentValidationResult,
+    summary="Validate an extracted document",
+    responses={
+        404: {"description": "Document not found."},
+    },
+)
+async def validate_document(
+    document_id: UUID,
+    extraction: ReceiptInvoiceExtraction,
+    settings: Annotated[Settings, Depends(get_settings)],
+    current_user: Annotated[CurrentUser, Depends(get_current_user)],
+) -> DocumentValidationResult:
+    """Validate extraction using M5.1 to M5.4 rules."""
+    session = _get_temp_upload_session(document_id, current_user.user_id)
+    local_staged_document = session is not None and _is_demo_storage_mode(settings)
+    metadata = None
+    if not local_staged_document:
+        metadata = await get_document_metadata(
+            document_id=document_id, user_id=current_user.user_id, settings=settings
+        )
+    if metadata is not None:
+        content_hash = metadata.content_hash or ""
+    else:
+        content_hash = session.content_hash if session else ""
+
+    t_val_total0 = time.perf_counter()
+    # M5.1 and M5.2
+    t_math0 = time.perf_counter()
+    quality_signals = derive_extraction_quality_signals(extraction)
+    t_math1 = time.perf_counter()
+    print(f"[STRUCTRA PERF] Math validation: {(t_math1 - t_math0)*1000:.1f} ms")
+
+    # M5.3 Duplicate Detection
+    t_dup0 = time.perf_counter()
+    if local_staged_document:
+        # Demo storage has no Supabase metadata table. Validation still runs
+        # locally, with duplicate detection scoped to saved records unavailable.
+        user_docs = []
+    else:
+        user_docs, _ = await list_document_metadata(
+            user_id=current_user.user_id, settings=settings
+        )
+    existing_documents = []
+    for doc in user_docs:
+        if doc.id != document_id:
+            candidate_ext = None
+            if doc.extraction_result:
+                try:
+                    candidate_ext = ReceiptInvoiceExtraction.model_validate(doc.extraction_result)
+                except Exception:
+                    pass
+            existing_documents.append(
+                DuplicateDocumentCandidate(
+                    document_id=doc.id,
+                    user_id=doc.user_id,
+                    content_hash=doc.content_hash,
+                    extraction=candidate_ext,
+                )
+            )
+
+    duplicate_result = detect_duplicate(
+        user_id=current_user.user_id,
+        content_hash=content_hash,
+        extraction=extraction,
+        existing_documents=existing_documents,
+    )
+    t_dup1 = time.perf_counter()
+    print(f"[STRUCTRA PERF] Duplicate detection (incl DB lookup): {(t_dup1 - t_dup0)*1000:.1f} ms")
+
+    # M5.4 Aggregation
+    result = aggregate_validation_results(
+        quality_signals=quality_signals,
+        duplicate_detection=duplicate_result,
+        extraction=extraction,
+    )
+    print(f"[STRUCTRA PERF] Validation Total: {(time.perf_counter() - t_val_total0)*1000:.1f} ms")
+    return result
+
+
+class SaveDocumentRequest(BaseModel):
+    extraction: ReceiptInvoiceExtraction | None = None
+    confidence_override: Literal["HIGH", "MEDIUM", "LOW"] | None = None
+
+
+@router.put(
+    "/{document_id}",
+    response_model=DocumentDetailResponse,
+    summary="Update extraction data for one owned document",
+    responses={
+        401: {"description": "Missing, malformed, expired, or invalid bearer token."},
+        404: {"description": "Document not found."},
+        503: {"description": "Metadata service is unavailable."},
+    },
+)
+async def update_document(
+    document_id: UUID,
+    payload: SaveDocumentRequest | ReceiptInvoiceExtraction,
+    settings: Annotated[Settings, Depends(get_settings)],
+    current_user: Annotated[CurrentUser, Depends(get_current_user)],
+) -> DocumentDetailResponse:
+    """Update extraction and recalculate validation & quality for an existing owned document."""
+    doc = await get_document_metadata(
+        document_id=document_id, user_id=current_user.user_id, settings=settings
+    )
+    if doc is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found.")
+
+    if isinstance(payload, ReceiptInvoiceExtraction):
+        extraction = payload
+        effective_override = (doc.quality_result or {}).get("confidence_override")
+    else:
+        extraction = payload.extraction or (
+            ReceiptInvoiceExtraction.model_validate(doc.extraction_result) if doc.extraction_result else None
+        )
+        if "confidence_override" in payload.model_fields_set:
+            effective_override = payload.confidence_override
+        else:
+            effective_override = (doc.quality_result or {}).get("confidence_override")
+
+    if extraction is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Extraction data is required.")
+
+    active_provider_info = getattr(default_ai_manager, "last_used_provider_info", None)
+    quality_model = evaluate_extraction_quality(
+        extraction, ocr_result=None, provider_info=active_provider_info, confidence_override=effective_override
+    )
+
+    await update_document_extraction_and_quality(
+        document_id=document_id,
+        user_id=current_user.user_id,
+        extraction=extraction.model_dump(mode="json"),
+        quality=quality_model.model_dump(mode="json"),
+        status="completed",
+        settings=settings,
+    )
+    doc.extraction_result = extraction.model_dump(mode="json")
+    doc.quality_result = quality_model.model_dump(mode="json")
+    doc.processed_at = datetime.now(timezone.utc)
+
+    if doc.content_hash:
+        await default_extraction_cache.set(doc.content_hash, extraction, settings=settings)
+
+    # Fire-and-forget notification: document edited
+    asyncio.create_task(
+        create_notification(
+            user_id=current_user.user_id,
+            event_type="document_edited",
+            document_name=doc.filename,
+            document_id=str(document_id),
+            settings=settings,
+        )
+    )
+
+    return await _build_detail_response(doc, settings)
+
+
+@router.post(
+    "/{document_id}/save",
+    response_model=DocumentDetailResponse,
+    summary="Save a processed document to the user's Document Library",
+    responses={
+        401: {"description": "Missing, malformed, expired, or invalid bearer token."},
+        404: {"description": "Document not found."},
+        503: {"description": "Metadata service is unavailable."},
+    },
+)
+async def save_document(
+    document_id: UUID,
+    settings: Annotated[Settings, Depends(get_settings)],
+    current_user: Annotated[CurrentUser, Depends(get_current_user)],
+    payload: SaveDocumentRequest | None = None,
+    force_save_duplicate: Annotated[bool, Query(description="If true, allow saving a duplicate copy to library.")] = False,
+) -> DocumentDetailResponse:
+    """Explicitly save a processed document to the authenticated user's persistent Document Library."""
+    # 1. Check if document already exists in DB
+    doc = await get_document_metadata(
+        document_id=document_id, user_id=current_user.user_id, settings=settings
+    )
+
+    if doc is not None:
+        # Determine effective confidence override:
+        # If payload has confidence_override explicitly set in fields_set, use it (can be "HIGH", "MEDIUM", "LOW", or None to clear).
+        # Else preserve any existing confidence_override on the document.
+        effective_override = None
+        is_override_specified = payload is not None and "confidence_override" in payload.model_fields_set
+        if is_override_specified:
+            effective_override = payload.confidence_override
+        elif doc.quality_result and doc.quality_result.get("confidence_override"):
+            effective_override = doc.quality_result.get("confidence_override")
+
+        if doc.status == "completed":
+            # If user provided updated extraction or confidence override, perform in-place update
+            has_ext_update = payload is not None and payload.extraction is not None
+            if has_ext_update or is_override_specified:
+                updated_ext = payload.extraction if has_ext_update else (
+                    ReceiptInvoiceExtraction.model_validate(doc.extraction_result) if doc.extraction_result else None
+                )
+                active_provider_info = getattr(default_ai_manager, "last_used_provider_info", None)
+                
+                if updated_ext is not None:
+                    quality_model = evaluate_extraction_quality(
+                        updated_ext, ocr_result=None, provider_info=active_provider_info, confidence_override=effective_override
+                    )
+                    await update_document_extraction_and_quality(
+                        document_id=document_id,
+                        user_id=current_user.user_id,
+                        extraction=updated_ext.model_dump(mode="json"),
+                        quality=quality_model.model_dump(mode="json"),
+                        status="completed",
+                        settings=settings,
+                    )
+                    doc.extraction_result = updated_ext.model_dump(mode="json")
+                    doc.quality_result = quality_model.model_dump(mode="json")
+                    doc.processed_at = datetime.now(timezone.utc)
+                    if doc.content_hash:
+                        await default_extraction_cache.set(doc.content_hash, updated_ext, settings=settings)
+
+                    # Fire-and-forget notification: document edited
+                    asyncio.create_task(
+                        create_notification(
+                            user_id=current_user.user_id,
+                            event_type="document_edited",
+                            document_name=doc.filename,
+                            document_id=str(document_id),
+                            settings=settings,
+                        )
+                    )
+
+            # Idempotent response for already-completed document (zero new rows created)
+            return await _build_detail_response(doc, settings)
+
+        # If document exists in DB but is not completed, commit it to completed
+        storage_path = doc.storage_path
+        filename = doc.filename
+        content_type = doc.content_type
+        size = doc.size
+        content_hash_to_commit = doc.content_hash
+        if not force_save_duplicate and not content_hash_to_commit:
+            try:
+                file_bytes = await download_document_from_storage(storage_path, settings)
+                content_hash_to_commit = hash_document_content(file_bytes)
+            except Exception:
+                pass
+
+        if payload and payload.extraction is not None:
+            updated_ext = payload.extraction
+            active_provider_info = getattr(default_ai_manager, "last_used_provider_info", None)
+            quality_model = evaluate_extraction_quality(
+                updated_ext, ocr_result=None, provider_info=active_provider_info, confidence_override=effective_override
+            )
+            await update_document_extraction_and_quality(
+                document_id=document_id,
+                user_id=current_user.user_id,
+                extraction=updated_ext.model_dump(mode="json"),
+                quality=quality_model.model_dump(mode="json"),
+                status="completed",
+                settings=settings,
+            )
+            doc.extraction_result = updated_ext.model_dump(mode="json")
+            doc.quality_result = quality_model.model_dump(mode="json")
+        elif is_override_specified and doc.extraction_result:
+            updated_ext = ReceiptInvoiceExtraction.model_validate(doc.extraction_result)
+            active_provider_info = getattr(default_ai_manager, "last_used_provider_info", None)
+            quality_model = evaluate_extraction_quality(
+                updated_ext, ocr_result=None, provider_info=active_provider_info, confidence_override=effective_override
+            )
+            await update_document_extraction_and_quality(
+                document_id=document_id,
+                user_id=current_user.user_id,
+                extraction=updated_ext.model_dump(mode="json"),
+                quality=quality_model.model_dump(mode="json"),
+                status="completed",
+                settings=settings,
+            )
+            doc.extraction_result = updated_ext.model_dump(mode="json")
+            doc.quality_result = quality_model.model_dump(mode="json")
+        else:
+            await update_document_status(
+                document_id=document_id,
+                user_id=current_user.user_id,
+                document_status="completed",
+                settings=settings,
+            )
+
+        doc.status = "completed"
+        doc.processed_at = datetime.now(timezone.utc)
+        if not force_save_duplicate and content_hash_to_commit:
+            doc.content_hash = content_hash_to_commit
+
+        # Fire-and-forget notification: document saved to library
+        asyncio.create_task(
+            create_notification(
+                user_id=current_user.user_id,
+                event_type="document_saved",
+                document_name=filename,
+                document_id=str(document_id),
+                settings=settings,
+            )
+        )
+
+        return await _build_detail_response(doc, settings)
+
+    # 2. Unsaved document: Locate storage path from session or Supabase Storage
+    session = _get_temp_upload_session(document_id, current_user.user_id)
+    if session is not None:
+        storage_path = session.storage_path
+        filename = session.filename
+        content_type = session.content_type
+        size = session.size
+        content_hash = session.content_hash
+        file_bytes = None
+    else:
+        found_path = await find_document_storage_path(
+            user_id=current_user.user_id, document_id=document_id, settings=settings
+        )
+        if not found_path:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found.")
+        storage_path = found_path
+        filename = PurePath(found_path).name
+        ext = PurePath(found_path).suffix.lower()
+        content_type = "application/pdf" if ext == ".pdf" else f"image/{ext.lstrip('.')}"
+        file_bytes = await download_document_from_storage(storage_path, settings)
+        size = len(file_bytes)
+        content_hash = hash_document_content(file_bytes)
+
+    # Check duplicate constraint against existing library rows (unless force_save_duplicate)
+    if not force_save_duplicate:
+        existing_duplicates = await find_document_metadata_by_content_hash(
+            content_hash=content_hash,
+            user_id=current_user.user_id,
+            settings=settings,
+        )
+        if existing_duplicates:
+            # Concurrency / Idempotency protection: return existing saved document
+            return await _build_detail_response(existing_duplicates[0], settings)
+
+    # Retrieve cached extraction & quality results
+    if payload is not None and payload.extraction is not None:
+        # The review workspace submits the user's confirmed extraction. Use it
+        # directly so demo saves don't require a second cloud AI request.
+        extraction_model = payload.extraction
+    else:
+        cached_extraction = await default_extraction_cache.get(content_hash, settings=settings)
+        if cached_extraction is not None:
+            extraction_model = ReceiptInvoiceExtraction.model_validate(
+                cached_extraction.model_dump(mode="json")
+            )
+        else:
+            if file_bytes is None:
+                file_bytes = await download_document_from_storage(storage_path, settings)
+            ocr_task = asyncio.create_task(
+                default_ocr_service.extract_text_from_bytes_async(file_bytes, filename=filename)
+            )
+            extraction_model = await default_ai_manager.extract_document(
+                file_bytes, content_type=content_type, ocr_task=ocr_task
+            )
+            await default_extraction_cache.set(content_hash, extraction_model, settings=settings)
+
+    effective_override = payload.confidence_override if payload else None
+    active_provider_info = getattr(default_ai_manager, "last_used_provider_info", None)
+    quality_model = evaluate_extraction_quality(
+        extraction_model, ocr_result=None, provider_info=active_provider_info, confidence_override=effective_override
+    )
+    if active_provider_info and active_provider_info.provider == "RapidOCR (local fallback)":
+        quality_model.needs_review = True
+        if not any(signal.code == "LOCAL_OCR_FALLBACK" for signal in quality_model.signals):
+            quality_model.signals.append(
+                QualitySignal(
+                    code="LOCAL_OCR_FALLBACK",
+                    severity="warning",
+                    message="Review the locally OCR-extracted fields before relying on them.",
+                )
+            )
+
+    # SINGLE PERSISTENCE BOUNDARY: Create the persistent record in public.documents
+    try:
+        created_record = await create_document_metadata(
+            document_id=document_id,
+            user_id=current_user.user_id,
+            filename=filename,
+            storage_path=storage_path,
+            content_type=content_type,
+            size=size,
+            content_hash=content_hash if not force_save_duplicate else None,
+            status="completed",
+            processed_at=datetime.now(timezone.utc),
+            extraction_result=extraction_model.model_dump(mode="json"),
+            quality_result=quality_model.model_dump(mode="json"),
+            settings=settings,
+        )
+    except HTTPException:
+        # Atomic Concurrency Safety: Check if concurrent request created document
+        existing_duplicates = await find_document_metadata_by_content_hash(
+            content_hash=content_hash,
+            user_id=current_user.user_id,
+            settings=settings,
+        )
+        if existing_duplicates:
+            return await _build_detail_response(existing_duplicates[0], settings)
+        raise
+
+    _remove_temp_upload_session(document_id)
+
+    # Fire-and-forget notification: document saved to library
+    asyncio.create_task(
+        create_notification(
+            user_id=current_user.user_id,
+            event_type="document_saved",
+            document_name=filename,
+            document_id=str(document_id),
+            settings=settings,
+        )
+    )
+
+    return await _build_detail_response(created_record, settings)
+
+
+def _metadata_response(metadata) -> DocumentMetadataResponse:
+    """Map internal database metadata to the public API contract."""
+    return DocumentMetadataResponse(
+        document_id=metadata.id,
+        filename=metadata.filename,
+        storage_path=metadata.storage_path,
+        content_type=metadata.content_type,
+        size=metadata.size,
+        status=metadata.status,
+        created_at=metadata.created_at,
+    )
+

@@ -1,0 +1,523 @@
+import { useState, useRef, useEffect, useCallback, useMemo } from 'react';
+import { Bell, ChevronDown, User, LogOut } from 'lucide-react';
+import { motion, AnimatePresence } from 'framer-motion';
+import { useAuth } from '../../../hooks/useAuth';
+import { useNavigate } from 'react-router-dom';
+import NotificationPanel from './NotificationPanel';
+import { getNotifications } from '../../../api/notifications';
+import { supabase } from '../../../lib/supabase';
+import { getUserAvatarUrl } from '../../../utils/avatar';
+
+/**
+ * TopBar
+ * Glassmorphism styling matching the main app cards.
+ * userName is derived from the authenticated user's metadata.
+ * Notification bell fetches real unread count from the backend.
+ */
+export default function TopBar({
+  userPlan = 'Free Plan',
+  isScrolled = false,
+}) {
+  const { user, logout } = useAuth();
+  const navigate = useNavigate();
+
+  const userName =
+    user?.user_metadata?.full_name ||
+    user?.user_metadata?.name ||
+    user?.name ||
+    user?.email?.split('@')[0] ||
+    'User';
+
+  const userEmail = user?.email || '';
+
+  const userPlanDisplay =
+    user?.user_metadata?.plan
+      ? (user.user_metadata.plan.toLowerCase().includes('plan') ? user.user_metadata.plan : `${user.user_metadata.plan} Plan`)
+      : userPlan;
+
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [bellOpen, setBellOpen] = useState(false);
+  const [unreadCount, setUnreadCount] = useState(0);
+
+  const menuRef = useRef(null);
+  const bellRef = useRef(null);
+
+  // ── Fetch real unread count on mount ──────────────────────
+  const fetchUnreadCount = useCallback(async () => {
+    try {
+      const data = await getNotifications();
+      setUnreadCount(data?.unread_count ?? 0);
+    } catch {
+      // silently ignore — non-critical
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchUnreadCount();
+
+    // 1. Instant local sync on any action (save, edit, delete, password change, etc.)
+    const handleNotificationUpdate = () => {
+      fetchUnreadCount();
+    };
+    window.addEventListener('structra:notifications-updated', handleNotificationUpdate);
+
+    // 2. Background polling fallback (every 10 seconds)
+    const interval = setInterval(fetchUnreadCount, 10_000);
+
+    // 3. Supabase Realtime subscription on security_activity table
+    let channel = null;
+    const userId = user?.id;
+    if (userId) {
+      try {
+        channel = supabase
+          .channel(`public:security_activity:${userId}`)
+          .on(
+            'postgres_changes',
+            {
+              event: '*',
+              schema: 'public',
+              table: 'security_activity',
+              filter: `user_id=eq.${userId}`,
+            },
+            () => {
+              fetchUnreadCount();
+            }
+          )
+          .subscribe();
+      } catch {
+        /* silent */
+      }
+    }
+
+    return () => {
+      window.removeEventListener('structra:notifications-updated', handleNotificationUpdate);
+      clearInterval(interval);
+      if (channel) {
+        supabase.removeChannel(channel);
+      }
+    };
+  }, [fetchUnreadCount, user?.id]);
+
+  // Close the account menu when clicking outside of it
+  useEffect(() => {
+    if (!menuOpen) return;
+    const handleOutside = (e) => {
+      if (menuRef.current && !menuRef.current.contains(e.target)) {
+        setMenuOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', handleOutside);
+    return () => document.removeEventListener('mousedown', handleOutside);
+  }, [menuOpen]);
+
+  const handleLogout = async () => {
+    setMenuOpen(false);
+    await logout();
+    navigate('/');
+  };
+
+  const handleBellClick = () => {
+    setBellOpen((v) => !v);
+    setMenuOpen(false);
+  };
+
+  const avatarUrl = useMemo(() => getUserAvatarUrl(user), [user]);
+  const [avatarLoadError, setAvatarLoadError] = useState(false);
+
+  useEffect(() => {
+    setAvatarLoadError(false);
+  }, [avatarUrl]);
+
+  const initials = userName
+    .split(' ')
+    .map((n) => n[0])
+    .join('')
+    .toUpperCase()
+    .slice(0, 2) || (userEmail.charAt(0) || 'U').toUpperCase();
+
+  /* ─── Shared glass button style ─────────────────────────── */
+  const glassStyle = {
+    background: 'rgba(255,255,255,0.07)',
+    backdropFilter: 'blur(24px) saturate(1.5)',
+    WebkitBackdropFilter: 'blur(24px) saturate(1.5)',
+    borderTop: '1px solid rgba(249,115,22,0.4)',
+    borderBottom: '1px solid rgba(249,115,22,0.4)',
+    borderLeft: '1px solid rgba(255,255,255,0.08)',
+    borderRight: '1px solid rgba(255,255,255,0.08)',
+    boxShadow: '0 4px 20px rgba(0,0,0,0.2), inset 0 1px 0 rgba(255,255,255,0.1)',
+  };
+
+  return (
+    <>
+      <style>{`
+        /*
+         * Smooth hover for glass icon buttons.
+         * Using CSS transitions instead of Framer whileHover so that
+         * both the enter AND leave transitions use the same curve.
+         * transform: scale() on the GPU layer — no layout shift, no jank.
+         */
+        .topbar-icon-btn {
+          transition:
+            transform 0.22s cubic-bezier(0.34, 1.56, 0.64, 1),
+            box-shadow  0.22s ease-out;
+          will-change: transform, box-shadow;
+        }
+        .topbar-icon-btn:hover {
+          transform: scale(1.05);
+          box-shadow:
+            0 0 18px rgba(249,115,22,0.28),
+            inset 0 0 14px rgba(249,115,22,0.14),
+            0 4px 20px rgba(0,0,0,0.2),
+            inset 0 1px 0 rgba(255,255,255,0.1);
+        }
+        .topbar-icon-btn:active {
+          transform: scale(0.96);
+          transition-duration: 0.10s;
+        }
+
+        /* Account popover */
+        .account-popover {
+          position: absolute;
+          top: calc(100% + 10px);
+          right: 0;
+          min-width: 220px;
+          border-radius: 14px;
+          background: rgba(14, 8, 2, 0.82);
+          backdrop-filter: blur(28px) saturate(1.5);
+          -webkit-backdrop-filter: blur(28px) saturate(1.5);
+          border: 1px solid rgba(249,115,22,0.22);
+          box-shadow: 0 12px 40px rgba(0,0,0,0.55), 0 0 0 1px rgba(255,255,255,0.04);
+          padding: 6px;
+          z-index: 200;
+          /* Smooth appear/disappear */
+          transform-origin: top right;
+          animation: popoverIn 0.18s cubic-bezier(0.34, 1.56, 0.64, 1) forwards;
+        }
+        @keyframes popoverIn {
+          from { opacity: 0; transform: scale(0.92) translateY(-6px); }
+          to   { opacity: 1; transform: scale(1)    translateY(0);     }
+        }
+
+        .account-popover-logout {
+          display: flex;
+          align-items: center;
+          gap: 9px;
+          width: 100%;
+          padding: 9px 12px;
+          border-radius: 9px;
+          background: transparent;
+          border: none;
+          cursor: pointer;
+          color: rgba(255, 110, 110, 0.88);
+          font-family: 'Inter', system-ui, sans-serif;
+          font-size: 13px;
+          font-weight: 500;
+          text-align: left;
+          transition: background 0.15s ease, color 0.15s ease;
+        }
+        .account-popover-logout:hover {
+          background: rgba(220, 60, 60, 0.12);
+          color: rgba(255, 140, 140, 1);
+        }
+      `}</style>
+
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: 16,
+          padding: '16px 28px 12px 28px',
+          position: 'sticky',
+          top: 0,
+          zIndex: 50,
+          transition: 'background 0.3s ease, backdrop-filter 0.3s ease',
+          background: isScrolled ? 'rgba(4,2,0,0.45)' : 'transparent',
+          backdropFilter: isScrolled ? 'blur(20px) saturate(1.2)' : 'none',
+          WebkitBackdropFilter: isScrolled ? 'blur(20px) saturate(1.2)' : 'none',
+          borderBottom: isScrolled ? '1px solid rgba(249,115,22,0.15)' : '1px solid transparent',
+        }}
+      >
+        {/* ── Workspace / System Status Badge ────────────────── */}
+        <div
+          id="topbar-workspace-badge"
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: 8,
+            padding: '7px 16px',
+            borderRadius: 50,
+            cursor: 'default',
+            userSelect: 'none',
+            ...glassStyle,
+          }}
+        >
+          <div
+            style={{
+              width: 7,
+              height: 7,
+              borderRadius: '50%',
+              background: '#4ade80',
+              boxShadow: '0 0 8px rgba(74, 222, 128, 0.8)',
+            }}
+          />
+          <span
+            style={{
+              fontSize: 12,
+              fontWeight: 600,
+              color: 'rgba(255, 248, 238, 0.90)',
+              fontFamily: "'Inter', system-ui, sans-serif",
+              letterSpacing: '0.01em',
+            }}
+          >
+            STRUCTRA Workspace
+          </span>
+        </div>
+
+        <div style={{ flex: 1 }} />
+
+        {/* ── Notification Bell ─────────────────────────────── */}
+        <div ref={bellRef} style={{ position: 'relative', flexShrink: 0 }}>
+          <button
+            id="notification-bell"
+            aria-label="Notifications"
+            aria-expanded={bellOpen}
+            aria-haspopup="true"
+            onClick={handleBellClick}
+            className="topbar-icon-btn"
+            style={{
+              position: 'relative',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              width: 44,
+              height: 44,
+              borderRadius: '50%',
+              cursor: 'pointer',
+              flexShrink: 0,
+              ...glassStyle,
+            }}
+          >
+            <Bell size={18} strokeWidth={1.8} color="rgba(255,240,220,0.85)" />
+
+            {/* Badge — real unread count */}
+            {unreadCount > 0 && (
+              <div
+                style={{
+                  position: 'absolute',
+                  top: -2,
+                  right: -2,
+                  minWidth: 18,
+                  height: 18,
+                  borderRadius: 9,
+                  background: 'linear-gradient(135deg, #f97316 0%, #ea580c 100%)',
+                  border: '1.5px solid rgba(20,10,5,0.9)',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  fontSize: 9.5,
+                  fontWeight: 700,
+                  color: '#fff',
+                  fontFamily: "'Inter', system-ui, sans-serif",
+                  lineHeight: 1,
+                  padding: '0 3px',
+                  boxShadow: '0 0 10px rgba(249,115,22,0.6)',
+                }}
+              >
+                {unreadCount > 99 ? '99+' : unreadCount}
+              </div>
+            )}
+          </button>
+
+          {/* Notification panel dropdown */}
+          <NotificationPanel
+            isOpen={bellOpen}
+            onClose={() => setBellOpen(false)}
+            onUnreadCountChange={setUnreadCount}
+          />
+        </div>
+
+        {/* ── User Profile ──────────────────────────────────── */}
+        {/* Wrapper gives us a relative anchor for the popover */}
+        <div ref={menuRef} style={{ position: 'relative', flexShrink: 0 }}>
+          <button
+            id="user-profile-menu"
+            aria-label="User menu"
+            aria-expanded={menuOpen}
+            aria-haspopup="true"
+            onClick={() => setMenuOpen((v) => !v)}
+            className="topbar-icon-btn"
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: 10,
+              padding: '5px 12px 5px 5px',
+              borderRadius: 50,
+              cursor: 'pointer',
+              ...glassStyle,
+            }}
+          >
+            {/* Avatar */}
+            <div
+              style={{
+                width: 34,
+                height: 34,
+                borderRadius: '50%',
+                background: 'linear-gradient(135deg, #ffb347 0%, #f97316 100%)',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                fontSize: 13,
+                fontWeight: 700,
+                color: '#fff',
+                fontFamily: "'Inter', system-ui, sans-serif",
+                flexShrink: 0,
+                letterSpacing: '0.03em',
+                boxShadow: '0 2px 8px rgba(249,115,22,0.4)',
+                overflow: 'hidden',
+              }}
+            >
+              {avatarUrl && !avatarLoadError ? (
+                <img
+                  src={avatarUrl.startsWith('/') ? `${import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000'}${avatarUrl}` : avatarUrl}
+                  alt={userName}
+                  onError={() => setAvatarLoadError(true)}
+                  style={{ width: '100%', height: '100%', objectFit: 'cover' }}
+                />
+              ) : (
+                initials
+              )}
+            </div>
+
+            {/* Name + plan */}
+            <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-start', gap: 1 }}>
+              <span
+                style={{
+                  fontSize: 12.5,
+                  fontWeight: 600,
+                  color: 'rgba(255,248,238,0.95)',
+                  fontFamily: "'Inter', system-ui, sans-serif",
+                  lineHeight: 1.25,
+                }}
+              >
+                {userName}
+              </span>
+              <span
+                style={{
+                  fontSize: 10.5,
+                  fontWeight: 600,
+                  color: '#ffb347',
+                  fontFamily: "'Inter', system-ui, sans-serif",
+                  lineHeight: 1.25,
+                }}
+              >
+                {userPlanDisplay}
+              </span>
+            </div>
+
+            <ChevronDown
+              size={14}
+              strokeWidth={2.5}
+              color="rgba(255,240,220,0.60)"
+              style={{
+                transition: 'transform 0.2s ease',
+                transform: menuOpen ? 'rotate(180deg)' : 'rotate(0deg)',
+              }}
+            />
+          </button>
+
+          {/* ── Account Popover ──────────────────────── */}
+          {menuOpen && (
+            <div className="account-popover" role="menu" aria-label="Account menu">
+              {/* User info header */}
+              <div
+                style={{
+                  padding: '10px 12px 8px',
+                  borderBottom: '1px solid rgba(255,255,255,0.07)',
+                  marginBottom: 4,
+                }}
+              >
+                {/* Display name (if different from email prefix) */}
+                {user?.user_metadata?.full_name && (
+                  <p
+                    style={{
+                      margin: '0 0 2px',
+                      fontSize: 13,
+                      fontWeight: 600,
+                      color: 'rgba(255,248,238,0.95)',
+                      fontFamily: "'Inter', system-ui, sans-serif",
+                      whiteSpace: 'nowrap',
+                      overflow: 'hidden',
+                      textOverflow: 'ellipsis',
+                    }}
+                  >
+                    {user.user_metadata.full_name}
+                  </p>
+                )}
+                {/* Email — always shown */}
+                <p
+                  style={{
+                    margin: 0,
+                    fontSize: 11.5,
+                    fontWeight: 400,
+                    color: 'rgba(255,240,220,0.50)',
+                    fontFamily: "'Inter', system-ui, sans-serif",
+                    whiteSpace: 'nowrap',
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                  }}
+                >
+                  {userEmail}
+                </p>
+              </div>
+
+              {/* Profile */}
+              <button
+                id="account-menu-profile"
+                className="account-popover-item"
+                role="menuitem"
+                onClick={() => {
+                  setMenuOpen(false);
+                  navigate('/app/profile');
+                }}
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 9,
+                  width: '100%',
+                  padding: '9px 12px',
+                  borderRadius: 9,
+                  background: 'transparent',
+                  border: 'none',
+                  cursor: 'pointer',
+                  color: 'rgba(255, 255, 255, 0.85)',
+                  fontFamily: "'Inter', system-ui, sans-serif",
+                  fontSize: 13,
+                  fontWeight: 500,
+                  textAlign: 'left',
+                  transition: 'background 0.15s ease',
+                  marginBottom: 2,
+                }}
+                onMouseEnter={(e) => (e.currentTarget.style.background = 'rgba(255, 255, 255, 0.08)')}
+                onMouseLeave={(e) => (e.currentTarget.style.background = 'transparent')}
+              >
+                <User size={14} strokeWidth={2} />
+                Profile
+              </button>
+
+              {/* Logout */}
+              <button
+                id="account-menu-logout"
+                className="account-popover-logout"
+                role="menuitem"
+                onClick={handleLogout}
+              >
+                <LogOut size={14} strokeWidth={2} />
+                Log out
+              </button>
+            </div>
+          )}
+        </div>
+      </div>
+    </>
+  );
+}

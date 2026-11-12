@@ -1,0 +1,771 @@
+"""Supabase PostgreSQL document metadata operations."""
+
+from __future__ import annotations
+
+from datetime import datetime, timezone
+import json
+from pathlib import Path
+import threading
+from typing import Any, Literal
+from uuid import UUID, uuid4
+
+import httpx
+from fastapi import HTTPException, status
+from pydantic import BaseModel, ValidationError
+
+from app.core.config import Settings
+
+DocumentProcessingStatus = Literal["pending", "processing", "completed", "failed"]
+
+SELECT_DOCUMENT_FIELDS = (
+    "id,user_id,filename,storage_path,content_type,size,status,created_at,"
+    "content_hash,processed_at,extraction_result,quality_result"
+)
+
+_DEMO_METADATA_PATH = Path(__file__).resolve().parents[2] / "demo_storage" / "document_metadata.json"
+_DEMO_METADATA_LOCK = threading.RLock()
+
+
+def _is_demo_metadata_mode(settings: Settings) -> bool:
+    """Use local metadata storage only when Supabase credentials are placeholders."""
+    supabase_url, secret_key = _extract_settings(settings)
+    publishable = getattr(settings, "supabase_publishable_key", "")
+    if hasattr(publishable, "get_secret_value"):
+        publishable = publishable.get_secret_value()
+    markers = ("example", "demo", "your-project", "placeholder")
+    return (
+        any(marker in supabase_url.lower() for marker in markers)
+        or str(secret_key).strip().lower() in {"dummy", "placeholder"}
+        or str(publishable).strip().lower() in {"dummy", "placeholder"}
+    )
+
+
+def _read_demo_metadata() -> list[dict[str, Any]]:
+    with _DEMO_METADATA_LOCK:
+        try:
+            data = json.loads(_DEMO_METADATA_PATH.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                return data
+            # Accept the single-record shape written by early demo builds.
+            if isinstance(data, dict) and data.get("id") and data.get("user_id"):
+                return [data]
+            return []
+        except (OSError, json.JSONDecodeError):
+            return []
+
+
+def _write_demo_metadata(records: list[dict[str, Any]]) -> None:
+    with _DEMO_METADATA_LOCK:
+        _DEMO_METADATA_PATH.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = _DEMO_METADATA_PATH.with_suffix(".tmp")
+        temporary_path.write_text(json.dumps(records, ensure_ascii=False), encoding="utf-8")
+        temporary_path.replace(_DEMO_METADATA_PATH)
+
+
+def _demo_record_matches(record: dict[str, Any], params: dict[str, str]) -> bool:
+    for key, value in params.items():
+        if key == "select":
+            continue
+        if key in {"user_id", "id", "content_hash", "status"}:
+            if value.startswith("eq.") and str(record.get(key, "")) != value[3:]:
+                return False
+    return True
+
+
+def _as_demo_record(record: dict[str, Any]) -> CreatedDocumentMetadata:
+    return CreatedDocumentMetadata.model_validate(record)
+
+
+def _list_demo_metadata(
+    *,
+    user_id: str,
+    page: int,
+    page_size: int,
+    status_filter: str | None,
+    needs_review: bool | None,
+    doc_type: str | None,
+    search: str | None,
+    sort_by: str | None,
+) -> tuple[list[CreatedDocumentMetadata], int]:
+    records = [record for record in _read_demo_metadata() if str(record.get("user_id")) == user_id]
+    effective_status = status_filter if status_filter is not None else "completed"
+    if effective_status and effective_status != "all":
+        records = [record for record in records if record.get("status") == effective_status]
+    if needs_review is not None:
+        records = [
+            record for record in records
+            if bool((record.get("quality_result") or {}).get("needs_review")) is needs_review
+        ]
+    if doc_type and doc_type.lower() != "all":
+        for_invoice = doc_type.upper() == "INVOICE"
+        records = [
+            record for record in records
+            if ("invoice" in str(record.get("filename", "")).lower()) is for_invoice
+        ]
+    if search and search.strip():
+        query = search.strip().casefold()
+        records = [
+            record for record in records
+            if query in str(record.get("filename", "")).casefold()
+            or any(
+                query in str(value or "").casefold()
+                for value in (record.get("extraction_result") or {}).values()
+                if isinstance(value, (str, int, float))
+            )
+        ]
+
+    total = len(records)
+    if sort_by == "oldest":
+        records.sort(key=lambda record: record.get("created_at", ""))
+    elif sort_by in {"amount_desc", "amount_asc"}:
+        records.sort(
+            key=lambda record: float((record.get("extraction_result") or {}).get("total") or 0),
+            reverse=sort_by == "amount_desc",
+        )
+    elif sort_by in {"date_desc", "doc_date_desc", "date_asc", "doc_date_asc"}:
+        reverse = sort_by in {"date_desc", "doc_date_desc"}
+        records.sort(
+            key=lambda record: str((record.get("extraction_result") or {}).get("date") or ""),
+            reverse=reverse,
+        )
+    else:
+        records.sort(key=lambda record: record.get("created_at", ""), reverse=True)
+
+    start = (page - 1) * page_size
+    return [_as_demo_record(record) for record in records[start : start + page_size]], total
+
+
+class CreatedDocumentMetadata(BaseModel):
+    """Database fields returned after inserting or querying a document record."""
+
+    id: UUID
+    user_id: UUID
+    filename: str
+    storage_path: str
+    content_type: str
+    size: int
+    status: str
+    created_at: datetime
+    content_hash: str | None = None
+    processed_at: datetime | None = None
+    extraction_result: dict[str, Any] | None = None
+    quality_result: dict[str, Any] | None = None
+
+
+def _extract_settings(settings: Settings) -> tuple[str, str]:
+    """Safely extract supabase_url and secret_key string even if settings is a mock SimpleNamespace."""
+    supabase_url = str(getattr(settings, "supabase_url", "https://example.supabase.co"))
+    secret_key_attr = getattr(settings, "supabase_secret_key", "test-secret-key")
+    if hasattr(secret_key_attr, "get_secret_value"):
+        secret_key = secret_key_attr.get_secret_value()
+    else:
+        secret_key = str(secret_key_attr)
+    return supabase_url, secret_key
+
+
+async def create_document_metadata(
+    *,
+    user_id: str,
+    filename: str,
+    storage_path: str,
+    content_type: str,
+    size: int,
+    content_hash: str | None = None,
+    document_id: UUID | str | None = None,
+    status: DocumentProcessingStatus = "pending",
+    processed_at: datetime | None = None,
+    extraction_result: dict[str, Any] | None = None,
+    quality_result: dict[str, Any] | None = None,
+    settings: Settings,
+) -> CreatedDocumentMetadata:
+    """Insert metadata for an already-stored document using the service key."""
+    if _is_demo_metadata_mode(settings):
+        row: dict[str, Any] = {
+            "id": str(document_id or uuid4()),
+            "user_id": user_id,
+            "filename": filename,
+            "storage_path": storage_path,
+            "content_type": content_type,
+            "size": size,
+            "status": status,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "content_hash": content_hash,
+            "processed_at": processed_at.isoformat() if processed_at else None,
+            "extraction_result": extraction_result,
+            "quality_result": quality_result,
+        }
+        records = [record for record in _read_demo_metadata() if record.get("id") != row["id"]]
+        records.append(row)
+        _write_demo_metadata(records)
+        return _as_demo_record(row)
+
+    supabase_url, secret_key = _extract_settings(settings)
+    headers = {
+        "apikey": secret_key,
+        "Authorization": f"Bearer {secret_key}",
+        "Content-Type": "application/json",
+        "Prefer": "return=representation",
+    }
+    payload: dict[str, Any] = {
+        "user_id": user_id,
+        "filename": filename,
+        "storage_path": storage_path,
+        "content_type": content_type,
+        "size": size,
+        "status": status,
+    }
+    if content_hash is not None:
+        payload["content_hash"] = content_hash
+    if document_id is not None:
+        payload["id"] = str(document_id)
+    if processed_at is not None:
+        payload["processed_at"] = processed_at.isoformat()
+    if extraction_result is not None:
+        payload["extraction_result"] = extraction_result
+    if quality_result is not None:
+        payload["quality_result"] = quality_result
+
+    documents_url = f"{supabase_url.rstrip('/')}/rest/v1/documents"
+
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            response = await client.post(documents_url, headers=headers, json=payload)
+    except httpx.RequestError as error:
+        print(f"METADATA REQUEST ERROR: {error}")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Document metadata service is unavailable.",
+        ) from error
+
+    if not response.is_success:
+        print(f"METADATA ERROR {response.status_code}: {response.text}")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Unable to save document metadata.",
+        )
+
+    try:
+        return CreatedDocumentMetadata.model_validate(response.json()[0])
+    except (IndexError, TypeError, ValidationError, ValueError):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Document metadata service returned an invalid response.",
+        ) from None
+
+
+async def list_document_metadata(
+    *,
+    user_id: str,
+    page: int = 1,
+    page_size: int = 20,
+    status_filter: str | None = None,
+    needs_review: bool | None = None,
+    doc_type: str | None = None,
+    search: str | None = None,
+    sort_by: str | None = "newest",
+    settings: Settings,
+) -> tuple[list[CreatedDocumentMetadata], int]:
+    """Return paginated metadata records owned by one authenticated user along with total count."""
+    if _is_demo_metadata_mode(settings):
+        return _list_demo_metadata(
+            user_id=user_id,
+            page=page,
+            page_size=page_size,
+            status_filter=status_filter,
+            needs_review=needs_review,
+            doc_type=doc_type,
+            search=search,
+            sort_by=sort_by,
+        )
+
+    offset = (page - 1) * page_size
+    supabase_url, secret_key = _extract_settings(settings)
+    headers = {
+        "apikey": secret_key,
+        "Authorization": f"Bearer {secret_key}",
+        "Prefer": "count=exact",
+    }
+    params: dict[str, str] = {
+        "select": SELECT_DOCUMENT_FIELDS,
+        "user_id": f"eq.{user_id}",
+        "limit": str(page_size),
+        "offset": str(offset),
+    }
+
+    and_conditions: list[str] = []
+
+    effective_status = status_filter if status_filter is not None else "completed"
+    if effective_status and effective_status != "all":
+        params["status"] = f"eq.{effective_status.strip()}"
+
+    if needs_review is True:
+        params["quality_result->needs_review"] = "eq.true"
+    elif needs_review is False:
+        and_conditions.append("or(quality_result->needs_review.is.null,quality_result->needs_review.eq.false)")
+
+    if doc_type and doc_type != "all":
+        dt = doc_type.upper()
+        if dt == "RECEIPT":
+            and_conditions.append("not.filename.ilike.*invoice*")
+        elif dt == "INVOICE":
+            and_conditions.append("or(filename.ilike.*invoice*,filename.ilike.*inv_*)")
+
+    if search and search.strip():
+        q_clean = search.strip().replace("(", "").replace(")", "").replace('"', '').replace(",", " ")
+        if q_clean:
+            search_clause = (
+                f"or(filename.ilike.*{q_clean}*,"
+                f"extraction_result->>vendor_company.ilike.*{q_clean}*,"
+                f"extraction_result->>invoice_number.ilike.*{q_clean}*,"
+                f"extraction_result->>date.ilike.*{q_clean}*,"
+                f"extraction_result->>address.ilike.*{q_clean}*)"
+            )
+            and_conditions.append(search_clause)
+
+    if and_conditions:
+        params["and"] = f"({','.join(and_conditions)})"
+
+    requires_custom_sort = sort_by in (
+        "date_desc", "doc_date_desc",
+        "date_asc", "doc_date_asc",
+        "amount_desc", "amount_asc",
+    )
+    if requires_custom_sort:
+        params["limit"] = "10000"
+        params["offset"] = "0"
+
+    if sort_by == "oldest":
+        params["order"] = "created_at.asc"
+    elif sort_by in ("date_desc", "doc_date_desc"):
+        params["order"] = "created_at.desc"
+    elif sort_by in ("date_asc", "doc_date_asc"):
+        params["order"] = "created_at.asc"
+    elif sort_by == "amount_desc":
+        params["order"] = "created_at.desc"
+    elif sort_by == "amount_asc":
+        params["order"] = "created_at.asc"
+    else:
+        params["order"] = "created_at.desc"
+
+    documents_url = f"{supabase_url.rstrip('/')}/rest/v1/documents"
+
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            response = await client.get(documents_url, headers=headers, params=params)
+    except httpx.RequestError as error:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Document metadata service is unavailable.",
+        ) from error
+
+    if not response.is_success:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Unable to retrieve document metadata.",
+        )
+
+    total_count = 0
+    content_range = response.headers.get("content-range")
+    if content_range and "/" in content_range:
+        total_str = content_range.rsplit("/", 1)[-1]
+        if total_str.isdigit():
+            total_count = int(total_str)
+
+    try:
+        records = [CreatedDocumentMetadata.model_validate(record) for record in response.json()]
+        if total_count == 0 and records:
+            total_count = len(records)
+
+        if requires_custom_sort:
+            from decimal import Decimal
+            from app.services.dashboard import parse_decimal_safe, parse_document_date
+
+            if sort_by in ("date_desc", "doc_date_desc"):
+                def sort_key_date_desc(doc: CreatedDocumentMetadata):
+                    ext = doc.extraction_result or {}
+                    d_val = parse_document_date(ext.get("date"), fallback_dt=doc.created_at)
+                    ordinal = d_val.toordinal() if d_val else 0
+                    created_ts = doc.created_at.timestamp() if doc.created_at else 0
+                    return (ordinal, created_ts, str(doc.id))
+
+                records.sort(key=sort_key_date_desc, reverse=True)
+                total_count = len(records)
+                records = records[offset : offset + page_size]
+
+            elif sort_by in ("date_asc", "doc_date_asc"):
+                def sort_key_date_asc(doc: CreatedDocumentMetadata):
+                    ext = doc.extraction_result or {}
+                    d_val = parse_document_date(ext.get("date"), fallback_dt=doc.created_at)
+                    ordinal = d_val.toordinal() if d_val else 9999999
+                    created_ts = doc.created_at.timestamp() if doc.created_at else 0
+                    return (ordinal, created_ts, str(doc.id))
+
+                records.sort(key=sort_key_date_asc, reverse=False)
+                total_count = len(records)
+                records = records[offset : offset + page_size]
+
+            elif sort_by == "amount_desc":
+                def sort_key_amt_desc(doc: CreatedDocumentMetadata):
+                    ext = doc.extraction_result or {}
+                    tot = parse_decimal_safe(ext.get("total")) or Decimal("0")
+                    created_ts = doc.created_at.timestamp() if doc.created_at else 0
+                    return (tot, created_ts, str(doc.id))
+
+                records.sort(key=sort_key_amt_desc, reverse=True)
+                total_count = len(records)
+                records = records[offset : offset + page_size]
+
+            elif sort_by == "amount_asc":
+                def sort_key_amt_asc(doc: CreatedDocumentMetadata):
+                    ext = doc.extraction_result or {}
+                    tot = parse_decimal_safe(ext.get("total"))
+                    tot_val = tot if tot is not None else Decimal("999999999")
+                    created_ts = doc.created_at.timestamp() if doc.created_at else 0
+                    return (tot_val, created_ts, str(doc.id))
+
+                records.sort(key=sort_key_amt_asc, reverse=False)
+                total_count = len(records)
+                records = records[offset : offset + page_size]
+
+        return records, total_count
+    except (TypeError, ValidationError, ValueError):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Document metadata service returned an invalid response.",
+        ) from None
+
+
+async def get_user_document_library_stats(
+    *, user_id: str, settings: Settings
+) -> tuple[int, int, int]:
+    """Return permanent lifetime library stats (total, processed, needs_review) for an authenticated user."""
+    if _is_demo_metadata_mode(settings):
+        records = [
+            record for record in _read_demo_metadata()
+            if str(record.get("user_id")) == user_id and record.get("status") == "completed"
+        ]
+        review_count = sum(
+            bool((record.get("quality_result") or {}).get("needs_review"))
+            for record in records
+        )
+        return len(records), len(records) - review_count, review_count
+
+    supabase_url, secret_key = _extract_settings(settings)
+    headers = {
+        "apikey": secret_key,
+        "Authorization": f"Bearer {secret_key}",
+    }
+    params = {
+        "select": "id,status,quality_result",
+        "user_id": f"eq.{user_id}",
+        "status": "eq.completed",
+    }
+    documents_url = f"{supabase_url.rstrip('/')}/rest/v1/documents"
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.get(documents_url, headers=headers, params=params)
+            if response.is_success:
+                docs = response.json()
+                total = len(docs)
+                def _doc_needs_review(d: dict) -> bool:
+                    q = d.get("quality_result") or {}
+                    eff = q.get("confidence_override") or q.get("system_confidence_level") or q.get("confidence_level")
+                    if not eff and q.get("overall_confidence") is not None:
+                        sc = q.get("overall_confidence", 0.0)
+                        eff = "HIGH" if sc >= 0.80 else "MEDIUM" if sc >= 0.55 else "LOW"
+                    if eff == "HIGH":
+                        return False
+                    if eff in ("MEDIUM", "LOW"):
+                        return True
+                    return q.get("needs_review") is True
+
+                needs_review = sum(1 for d in docs if _doc_needs_review(d))
+                processed = total - needs_review
+                return total, processed, needs_review
+    except Exception:
+        pass
+    return 0, 0, 0
+
+
+async def get_document_metadata(
+    *, document_id: UUID, user_id: str, settings: Settings
+) -> CreatedDocumentMetadata | None:
+    """Return one metadata record only when it belongs to the current user."""
+    records = await _get_document_metadata(
+        params={
+            "select": SELECT_DOCUMENT_FIELDS,
+            "id": f"eq.{document_id}",
+            "user_id": f"eq.{user_id}",
+        },
+        settings=settings,
+    )
+    return records[0] if records else None
+
+
+async def find_document_metadata_by_content_hash(
+    *, content_hash: str, user_id: str, settings: Settings
+) -> list[CreatedDocumentMetadata]:
+    """Find same-user saved library document rows with matching content hash."""
+    try:
+        return await _get_document_metadata(
+            params={
+                "select": SELECT_DOCUMENT_FIELDS,
+                "user_id": f"eq.{user_id}",
+                "content_hash": f"eq.{content_hash}",
+                "status": "eq.completed",
+            },
+            settings=settings,
+        )
+    except HTTPException:
+        return []
+
+
+async def delete_document_metadata(
+    *, document_id: UUID, user_id: str, settings: Settings
+) -> None:
+    """Delete one metadata row owned by the authenticated user."""
+    if _is_demo_metadata_mode(settings):
+        records = _read_demo_metadata()
+        kept = [
+            record for record in records
+            if not (str(record.get("id")) == str(document_id) and str(record.get("user_id")) == user_id)
+        ]
+        if len(kept) == len(records):
+            raise HTTPException(status_code=404, detail="Document not found.")
+        _write_demo_metadata(kept)
+        return
+
+    supabase_url, secret_key = _extract_settings(settings)
+    headers = {
+        "apikey": secret_key,
+        "Authorization": f"Bearer {secret_key}",
+        "Prefer": "return=representation",
+    }
+    documents_url = f"{supabase_url.rstrip('/')}/rest/v1/documents"
+    params = {
+        "id": f"eq.{document_id}",
+        "user_id": f"eq.{user_id}",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            response = await client.delete(documents_url, headers=headers, params=params)
+    except httpx.RequestError as error:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Document metadata service is unavailable.",
+        ) from error
+
+    if not response.is_success:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Unable to delete document metadata.",
+        )
+
+    try:
+        deleted_records = response.json()
+    except ValueError:
+        deleted_records = None
+    if not isinstance(deleted_records, list) or len(deleted_records) != 1:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Unable to delete document metadata.",
+        )
+
+
+async def update_document_status(
+    *,
+    document_id: UUID,
+    user_id: str,
+    document_status: DocumentProcessingStatus,
+    processed_at: datetime | None = None,
+    settings: Settings,
+) -> None:
+    """Persist one extraction lifecycle status for an owned document."""
+    if _is_demo_metadata_mode(settings):
+        records = _read_demo_metadata()
+        for record in records:
+            if str(record.get("id")) == str(document_id) and str(record.get("user_id")) == user_id:
+                record["status"] = document_status
+                if document_status in ("completed", "failed"):
+                    record["processed_at"] = (processed_at or datetime.now(timezone.utc)).isoformat()
+                _write_demo_metadata(records)
+                return
+        raise HTTPException(status_code=404, detail="Document not found.")
+
+    supabase_url, secret_key = _extract_settings(settings)
+    headers = {
+        "apikey": secret_key,
+        "Authorization": f"Bearer {secret_key}",
+        "Content-Type": "application/json",
+        "Prefer": "return=representation",
+    }
+    documents_url = f"{supabase_url.rstrip('/')}/rest/v1/documents"
+    params = {
+        "id": f"eq.{document_id}",
+        "user_id": f"eq.{user_id}",
+    }
+    patch_payload: dict[str, str] = {"status": document_status}
+    if document_status in ("completed", "failed"):
+        dt = processed_at or datetime.now(timezone.utc)
+        patch_payload["processed_at"] = dt.isoformat()
+
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            response = await client.patch(
+                documents_url,
+                headers=headers,
+                params=params,
+                json=patch_payload,
+            )
+    except httpx.RequestError as error:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Document metadata service is unavailable.",
+        ) from error
+
+    if not response.is_success:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Unable to update document status.",
+        )
+
+    try:
+        updated_records = response.json()
+    except ValueError:
+        updated_records = None
+    if not isinstance(updated_records, list) or len(updated_records) != 1:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Unable to update document status.",
+        )
+
+
+async def update_document_extraction_and_quality(
+    *,
+    document_id: UUID,
+    user_id: str,
+    extraction: dict[str, Any],
+    quality: dict[str, Any] | None = None,
+    status: str = "completed",
+    settings: Settings,
+) -> CreatedDocumentMetadata | None:
+    """Save final extraction and quality JSON to the user's document row and set status to completed."""
+    if _is_demo_metadata_mode(settings):
+        records = _read_demo_metadata()
+        for record in records:
+            if str(record.get("id")) == str(document_id) and str(record.get("user_id")) == user_id:
+                record["status"] = status
+                record["processed_at"] = datetime.now(timezone.utc).isoformat()
+                record["extraction_result"] = extraction
+                if quality is not None:
+                    record["quality_result"] = quality
+                _write_demo_metadata(records)
+                return _as_demo_record(record)
+        return None
+
+    supabase_url, secret_key = _extract_settings(settings)
+    headers = {
+        "apikey": secret_key,
+        "Authorization": f"Bearer {secret_key}",
+        "Content-Type": "application/json",
+        "Prefer": "return=representation",
+    }
+    documents_url = f"{supabase_url.rstrip('/')}/rest/v1/documents"
+    params = {
+        "id": f"eq.{document_id}",
+        "user_id": f"eq.{user_id}",
+    }
+    patch_payload: dict[str, Any] = {
+        "status": status,
+        "processed_at": datetime.now(timezone.utc).isoformat(),
+        "extraction_result": extraction,
+    }
+    if quality is not None:
+        patch_payload["quality_result"] = quality
+
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            response = await client.patch(
+                documents_url,
+                headers=headers,
+                params=params,
+                json=patch_payload,
+            )
+    except httpx.RequestError as error:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Document metadata service is unavailable.",
+        ) from error
+
+    if not response.is_success:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Unable to save document extraction.",
+        )
+
+    try:
+        records = response.json()
+        if records and len(records) > 0:
+            return CreatedDocumentMetadata.model_validate(records[0])
+    except Exception:
+        pass
+    return None
+
+
+_SHARED_ASYNC_CLIENT: httpx.AsyncClient | None = None
+
+
+def _get_shared_client() -> httpx.AsyncClient:
+    """Return reusable HTTP client with connection pooling for Supabase REST calls."""
+    global _SHARED_ASYNC_CLIENT
+    if _SHARED_ASYNC_CLIENT is None or _SHARED_ASYNC_CLIENT.is_closed:
+        _SHARED_ASYNC_CLIENT = httpx.AsyncClient(
+            timeout=20.0,
+            limits=httpx.Limits(max_keepalive_connections=20, max_connections=50),
+        )
+    return _SHARED_ASYNC_CLIENT
+
+
+async def _get_document_metadata(
+    *, params: dict[str, str], settings: Settings
+) -> list[CreatedDocumentMetadata]:
+    """Fetch document rows through the backend-only Supabase REST client."""
+    if _is_demo_metadata_mode(settings):
+        return [
+            _as_demo_record(record)
+            for record in _read_demo_metadata()
+            if _demo_record_matches(record, params)
+        ]
+
+    supabase_url, secret_key = _extract_settings(settings)
+    headers = {
+        "apikey": secret_key,
+        "Authorization": f"Bearer {secret_key}",
+    }
+    documents_url = f"{supabase_url.rstrip('/')}/rest/v1/documents"
+
+    try:
+        client = _get_shared_client()
+        response = await client.get(documents_url, headers=headers, params=params)
+    except httpx.RequestError as error:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Document metadata service is unavailable.",
+        ) from error
+
+    if not response.is_success:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Unable to retrieve document metadata.",
+        )
+
+    try:
+        return [CreatedDocumentMetadata.model_validate(record) for record in response.json()]
+    except (TypeError, ValidationError, ValueError):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Document metadata service returned an invalid response.",
+        ) from None
+
+
