@@ -6,7 +6,6 @@ build-backend = "hatchling.build"
 name = "structra-backend"
 version = "0.1.0"
 description = "Backend foundation for Structra."
-readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.115,<1.0",

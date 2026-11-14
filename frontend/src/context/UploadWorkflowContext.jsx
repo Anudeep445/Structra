@@ -372,20 +372,39 @@ export function UploadWorkflowProvider({ children }) {
         line_total: parseNum(item.amount || item.line_total),
       }));
       const total = parseNum(updatedData.totalAmount);
+      const sourceExtraction = currentWf.extractionResult?.extraction || {};
+      const sourceSubtotal = sourceExtraction.subtotal ?? lineItems.reduce((sum, item) => sum + item.line_total, 0);
+      const taxableBase = sourceExtraction.taxable_amount
+        ?? Math.max(0, parseNum(sourceSubtotal) - parseNum(sourceExtraction.discount));
+      const parseOptionalNum = (value) => {
+        if (value === null || value === undefined || String(value).trim() === '') return null;
+        const parsed = Number(String(value).replace(/[^0-9.-]/g, ''));
+        return Number.isFinite(parsed) ? parsed : null;
+      };
+      const taxComponents = (updatedData.taxComponents || []).map((component) => {
+        const rate = parseOptionalNum(component.rate);
+        const enteredAmount = parseOptionalNum(component.amount);
+        return {
+          name: String(component.name || '').trim() || 'Tax',
+          rate,
+          amount: enteredAmount ?? (rate === null ? null : Math.round(taxableBase * rate) / 100),
+        };
+      });
+      const tax = taxComponents.reduce((sum, component) => sum + (component.amount ?? 0), 0);
       extractionPayload = {
         vendor_company: updatedData.vendor ?? currentWf.extractionResult?.extraction?.vendor_company ?? '',
         date: updatedData.date ?? currentWf.extractionResult?.extraction?.date ?? '',
         address: updatedData.address ?? currentWf.extractionResult?.extraction?.address ?? '',
         invoice_number: updatedData.invoiceNumber ?? currentWf.extractionResult?.extraction?.invoice_number ?? '',
         total: total,
-        subtotal: currentWf.extractionResult?.extraction?.subtotal ?? total,
-        tax: currentWf.extractionResult?.extraction?.tax ?? 0,
-        taxable_amount: currentWf.extractionResult?.extraction?.taxable_amount ?? null,
-        tax_components: currentWf.extractionResult?.extraction?.tax_components ?? [],
-        additional_charges: currentWf.extractionResult?.extraction?.additional_charges ?? [],
-        service_charge: currentWf.extractionResult?.extraction?.service_charge ?? null,
-        round_off: currentWf.extractionResult?.extraction?.round_off ?? null,
-        discount: currentWf.extractionResult?.extraction?.discount ?? 0,
+        subtotal: sourceExtraction.subtotal ?? sourceSubtotal,
+        tax,
+        taxable_amount: sourceExtraction.taxable_amount ?? null,
+        tax_components: taxComponents,
+        additional_charges: sourceExtraction.additional_charges ?? [],
+        service_charge: sourceExtraction.service_charge ?? null,
+        round_off: sourceExtraction.round_off ?? null,
+        discount: sourceExtraction.discount ?? 0,
         line_items: lineItems,
       };
     }

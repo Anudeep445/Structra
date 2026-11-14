@@ -40,7 +40,8 @@ const MOCK_RESULT = {
     { item: "Rice 1kg", qty: 1, rate: "₹\u00A078.00", amount: "₹\u00A078.00" },
     { item: "Fortune Sunflower Oil 1L", qty: 1, rate: "₹\u00A0145.00", amount: "₹\u00A0145.00" },
     { item: "Tata Tea Premium 250g", qty: 1, rate: "₹\u00A0110.00", amount: "₹\u00A0110.00" },
-  ]
+  ],
+  taxComponents: [],
 };
 
 export default function ExtractionResultWorkspace({ 
@@ -99,21 +100,35 @@ export default function ExtractionResultWorkspace({
   }, []);
 
   const baseData = useMemo(() => {
-    return extractionResult?.extraction ? {
-      vendor: extractionResult.extraction.vendor_company || '—',
-      date: extractionResult.extraction.date || '—',
-      address: extractionResult.extraction.address || '—',
-      invoiceNumber: extractionResult.extraction.invoice_number || '—',
-      totalAmount: formatCurrency(extractionResult.extraction.total),
+    const extraction = extractionResult?.extraction;
+    if (!extraction) return MOCK_RESULT;
+
+    const taxComponents = Array.isArray(extraction.tax_components) && extraction.tax_components.length
+      ? extraction.tax_components.map((component) => ({
+          name: component.name || 'Tax',
+          rate: component.rate ?? '',
+          amount: component.amount ?? '',
+        }))
+      : extraction.tax !== null && extraction.tax !== undefined
+        ? [{ name: 'Tax (unitemized)', rate: '', amount: extraction.tax }]
+        : [];
+
+    return {
+      vendor: extraction.vendor_company || '—',
+      date: extraction.date || '—',
+      address: extraction.address || '—',
+      invoiceNumber: extraction.invoice_number || '—',
+      totalAmount: formatCurrency(extraction.total),
       confidenceOverride: extractionResult.quality?.confidence_override || null,
       mlClassification: extractionResult.ml_classification || null,
-      lineItems: (extractionResult.extraction.line_items || []).map(li => ({
+      taxComponents,
+      lineItems: (extraction.line_items || []).map(li => ({
         item: li.description || '—',
         qty: li.quantity !== null && li.quantity !== undefined ? li.quantity : '—',
         rate: li.unit_price !== null && li.unit_price !== undefined ? formatCurrency(li.unit_price) : '—',
         amount: li.line_total !== null && li.line_total !== undefined ? formatCurrency(li.line_total) : '—'
       }))
-    } : MOCK_RESULT;
+    };
   }, [extractionResult]);
 
   const displayData = editedData || baseData;
@@ -966,15 +981,21 @@ export default function ExtractionResultWorkspace({
 function ExtractionResultsRightPanel({ stage, setStage, validationResult, resetUpload, displayData, extractionResult }) {
   const extraction = extractionResult?.extraction || {};
   const asAmount = (value) => {
-    const parsed = Number(value);
+    if (value === null || value === undefined || String(value).trim() === '') return null;
+    const normalized = typeof value === 'string' ? value.replace(/[^0-9.-]/g, '') : value;
+    if (normalized === '') return null;
+    const parsed = Number(normalized);
     return Number.isFinite(parsed) ? parsed : null;
   };
-  const lineItemsSubtotal = (extraction.line_items || []).reduce(
-    (sum, item) => sum + (asAmount(item.line_total) || 0), 0
+  const lineItemsSubtotal = (displayData.lineItems || extraction.line_items || []).reduce(
+    (sum, item) => sum + (asAmount(item.amount ?? item.line_total) || 0), 0
   );
   const printedSubtotal = asAmount(extraction.subtotal);
   const subtotalForReconciliation = printedSubtotal ?? lineItemsSubtotal;
-  const rawTaxComponents = Array.isArray(extraction.tax_components) ? extraction.tax_components : [];
+  const hasEditedTaxComponents = Array.isArray(displayData.taxComponents);
+  const rawTaxComponents = hasEditedTaxComponents
+    ? displayData.taxComponents
+    : (Array.isArray(extraction.tax_components) ? extraction.tax_components : []);
   const taxCalculationBase = asAmount(extraction.taxable_amount)
     ?? Math.max(0, subtotalForReconciliation - (asAmount(extraction.discount) || 0));
   const taxRows = rawTaxComponents.map((component) => {
@@ -985,7 +1006,7 @@ function ExtractionResultsRightPanel({ stage, setStage, validationResult, resetU
     );
     return { name: component.name || 'GST', rate, amount: calculatedAmount };
   }).filter((component) => component.amount !== null);
-  if (taxRows.length === 0 && asAmount(extraction.tax) !== null) {
+  if (!hasEditedTaxComponents && taxRows.length === 0 && asAmount(extraction.tax) !== null) {
     taxRows.push({ name: 'Tax (unitemized)', rate: null, amount: asAmount(extraction.tax) });
   }
   const taxTotal = taxRows.reduce((sum, component) => sum + component.amount, 0);
@@ -1426,6 +1447,23 @@ function ReviewEditView({ setStage, displayData, onSave, extractionResult }) {
     newItems[idx] = val;
     setLocalData(prev => ({ ...prev, lineItems: newItems }));
   };
+  const updateTaxComponent = (idx, field, value) => {
+    const taxComponents = [...(localData.taxComponents || [])];
+    taxComponents[idx] = { ...taxComponents[idx], [field]: value };
+    updateField('taxComponents', taxComponents);
+  };
+  const taxComponents = Array.isArray(localData.taxComponents) ? localData.taxComponents : [];
+  const taxInputStyle = {
+    width: '100%',
+    background: 'rgba(255,255,255,0.05)',
+    border: '1px solid rgba(255,255,255,0.15)',
+    borderRadius: 6,
+    padding: '9px 10px',
+    color: '#fff',
+    fontSize: 13,
+    outline: 'none',
+    boxSizing: 'border-box',
+  };
 
   return (
     <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
@@ -1476,6 +1514,81 @@ function ReviewEditView({ setStage, displayData, onSave, extractionResult }) {
             </tbody>
           </table>
         </div>
+      </div>
+
+      <div style={{
+        background: 'rgba(255,255,255,0.045)',
+        border: '1px solid rgba(255,255,255,0.09)',
+        borderRadius: 12,
+        padding: 16,
+        marginBottom: 16,
+      }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, marginBottom: 12 }}>
+          <h4 style={{ fontSize: 14, fontWeight: 600, color: '#fff', margin: 0 }}>Taxes</h4>
+          <button
+            type="button"
+            onClick={() => updateField('taxComponents', [...taxComponents, { name: 'Tax', rate: '', amount: '' }])}
+            style={{
+              display: 'flex', alignItems: 'center', gap: 6,
+              background: 'rgba(249,115,22,0.12)', border: '1px solid rgba(249,115,22,0.3)',
+              borderRadius: 6, padding: '7px 10px', color: '#fb923c', cursor: 'pointer',
+              fontSize: 12, fontWeight: 600,
+            }}
+          >
+            <Plus size={14} /> Add tax
+          </button>
+        </div>
+        {taxComponents.length === 0 ? (
+          <p style={{ margin: 0, color: 'rgba(255,240,220,0.55)', fontSize: 13 }}>No taxes identified. Add one if it appears on the receipt.</p>
+        ) : (
+          <>
+            <div style={{ display: 'grid', gridTemplateColumns: 'minmax(120px, 2fr) minmax(80px, 1fr) minmax(100px, 1fr) 32px', gap: 8, marginBottom: 6 }}>
+              <span style={{ color: 'rgba(255,240,220,0.55)', fontSize: 11 }}>Tax name</span>
+              <span style={{ color: 'rgba(255,240,220,0.55)', fontSize: 11 }}>Rate (%)</span>
+              <span style={{ color: 'rgba(255,240,220,0.55)', fontSize: 11 }}>Amount</span>
+              <span />
+            </div>
+            {taxComponents.map((component, idx) => (
+              <div key={idx} style={{ display: 'grid', gridTemplateColumns: 'minmax(120px, 2fr) minmax(80px, 1fr) minmax(100px, 1fr) 32px', gap: 8, marginBottom: 8 }}>
+                <input
+                  type="text"
+                  aria-label={`Tax ${idx + 1} name`}
+                  value={component.name ?? ''}
+                  onChange={(e) => updateTaxComponent(idx, 'name', e.target.value)}
+                  style={taxInputStyle}
+                />
+                <input
+                  type="number"
+                  step="0.01"
+                  aria-label={`Tax ${idx + 1} rate`}
+                  value={component.rate ?? ''}
+                  onChange={(e) => updateTaxComponent(idx, 'rate', e.target.value)}
+                  style={taxInputStyle}
+                />
+                <input
+                  type="number"
+                  step="0.01"
+                  aria-label={`Tax ${idx + 1} amount`}
+                  value={component.amount ?? ''}
+                  onChange={(e) => updateTaxComponent(idx, 'amount', e.target.value)}
+                  style={taxInputStyle}
+                />
+                <button
+                  type="button"
+                  aria-label={`Remove tax ${idx + 1}`}
+                  onClick={() => updateField('taxComponents', taxComponents.filter((_, itemIdx) => itemIdx !== idx))}
+                  style={{
+                    display: 'flex', alignItems: 'center', justifyContent: 'center',
+                    background: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.25)',
+                    borderRadius: 6, color: '#f87171', cursor: 'pointer',
+                  }}
+                >
+                  <Trash2 size={14} />
+                </button>
+              </div>
+            ))}
+          </>
+        )}
       </div>
 
       {/* Sticky Action Bar (For Review Mode: Complete Review) */}

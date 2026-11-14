@@ -832,6 +832,25 @@ export default function DocumentLibraryPage() {
         line_total: parseNum(item.amount || item.line_total),
       }));
       total = parseNum(updatedDisplayData.totalAmount);
+      const sourceExtraction = detailData?.extraction || {};
+      const sourceSubtotal = sourceExtraction.subtotal ?? lineItems.reduce((sum, item) => sum + item.line_total, 0);
+      const taxableBase = sourceExtraction.taxable_amount
+        ?? Math.max(0, parseNum(sourceSubtotal) - parseNum(sourceExtraction.discount));
+      const parseOptionalNum = (value) => {
+        if (value === null || value === undefined || String(value).trim() === '') return null;
+        const parsed = Number(String(value).replace(/[^0-9.-]/g, ''));
+        return Number.isFinite(parsed) ? parsed : null;
+      };
+      const taxComponents = (updatedDisplayData.taxComponents || []).map((component) => {
+        const rate = parseOptionalNum(component.rate);
+        const enteredAmount = parseOptionalNum(component.amount);
+        return {
+          name: String(component.name || '').trim() || 'Tax',
+          rate,
+          amount: enteredAmount ?? (rate === null ? null : Math.round(taxableBase * rate) / 100),
+        };
+      });
+      const tax = taxComponents.reduce((sum, component) => sum + (component.amount ?? 0), 0);
 
       extractionPayload = {
         vendor_company: updatedDisplayData.vendor ?? detailData?.extraction?.vendor_company ?? '',
@@ -839,14 +858,14 @@ export default function DocumentLibraryPage() {
         address: updatedDisplayData.address ?? detailData?.extraction?.address ?? '',
         invoice_number: updatedDisplayData.invoiceNumber ?? detailData?.extraction?.invoice_number ?? '',
         total: total,
-        subtotal: detailData?.extraction?.subtotal ?? total,
-        tax: detailData?.extraction?.tax ?? 0,
-        taxable_amount: detailData?.extraction?.taxable_amount ?? null,
-        tax_components: detailData?.extraction?.tax_components ?? [],
-        additional_charges: detailData?.extraction?.additional_charges ?? [],
-        service_charge: detailData?.extraction?.service_charge ?? null,
-        round_off: detailData?.extraction?.round_off ?? null,
-        discount: detailData?.extraction?.discount ?? 0,
+        subtotal: sourceExtraction.subtotal ?? sourceSubtotal,
+        tax,
+        taxable_amount: sourceExtraction.taxable_amount ?? null,
+        tax_components: taxComponents,
+        additional_charges: sourceExtraction.additional_charges ?? [],
+        service_charge: sourceExtraction.service_charge ?? null,
+        round_off: sourceExtraction.round_off ?? null,
+        discount: sourceExtraction.discount ?? 0,
         line_items: lineItems,
       };
     }
